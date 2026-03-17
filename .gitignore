@@ -42,6 +42,7 @@ archive/
 qdrant_data/
 docker/qdrant_data/
 data/mock_live_state/
+data/gitops_repo/_changes/
 
 # Logs and temporary files
 *.log

@@ -1,0 +1,19 @@
+{
+  "kind": "apply",
+  "run_id": "run_c8bccb38c1",
+  "author": "sre-agent",
+  "base_branch": "main",
+  "branch": "sre-agent/run_c8bccb38c1/apply",
+  "manifest": "clusters/prod/checkout.json",
+  "created_at": "2026-03-12T20:45:46.886939Z",
+  "action": {
+    "action_type": "gitops_scale_deployment",
+    "namespace": "prod",
+    "target": "checkout",
+    "reason": "Increase replicas through GitOps because this workload is config-managed.",
+    "execution_model": "gitops",
+    "replicas": 2,
+    "previous_replicas": 1,
+    "manifest_path": "clusters/prod/checkout.json"
+  }
+}

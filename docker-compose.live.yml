@@ -1,0 +1,18 @@
+services:
+  sre-agent:
+    environment:
+      SRE_MCP_BACKEND: live
+      PROMETHEUS_BASE_URL: ${PROMETHEUS_BASE_URL}
+      LOKI_BASE_URL: ${LOKI_BASE_URL}
+      SRE_LOGS_BACKEND: ${SRE_LOGS_BACKEND:-loki}
+      KUBECONFIG: /app/secrets/kubeconfig
+      KUBECTL_CONTEXT: ${KUBECTL_CONTEXT}
+    volumes:
+      - ${KUBECONFIG}:/app/secrets/kubeconfig:ro
+
+  executor:
+    environment:
+      KUBECONFIG: /app/secrets/kubeconfig
+      KUBECTL_CONTEXT: ${KUBECTL_CONTEXT}
+    volumes:
+      - ${KUBECONFIG}:/app/secrets/kubeconfig:ro

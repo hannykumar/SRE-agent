@@ -1,0 +1,402 @@
+{
+  "catalog_version": "2026-03-12.2",
+  "incident_types": [
+    {
+      "incident_type": "CrashLoopBackOff",
+      "summary": "Pods restart repeatedly because the workload crashes or is killed by the platform.",
+      "keywords": ["crashloop", "oomkilled", "oom", "out of memory", "restart", "backoff", "killed"],
+      "runbook_files": ["01_crashloopbackoff_oomkilled.md", "03_high_memory_leak.md"],
+      "discriminating_tools": ["get_pod_status", "describe_pod", "get_metrics", "get_pod_logs", "get_recent_deploys"],
+      "confirmation_rules": [
+        {
+          "rule_id": "crashloop_oomkilled_reason",
+          "all": [{"path": "pod_describe.last_state.terminated.reason", "equals": "OOMKilled"}],
+          "confidence": 0.97,
+          "citations": ["tool:describe_pod"],
+          "reason": "The pod termination reason is OOMKilled."
+        },
+        {
+          "rule_id": "crashloop_memory_and_logs",
+          "all": [
+            {"path": "metrics.memory_percent", "gte": 90},
+            {"path": "logs_tail", "contains": "out of memory"}
+          ],
+          "confidence": 0.9,
+          "citations": ["tool:get_metrics", "tool:get_pod_logs"],
+          "reason": "Memory saturation and out-of-memory logs confirm the crash pattern."
+        },
+        {
+          "rule_id": "crashloop_restart_signal",
+          "all": [
+            {"path": "pod_status.restarts", "gte": 5},
+            {"path": "pod_status.reason", "contains": "CrashLoop"}
+          ],
+          "confidence": 0.75,
+          "citations": ["tool:get_pod_status"],
+          "reason": "Restart count and pod reason both show a crash loop."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "error_rate_percent", "direction": "decrease", "optional": true},
+        {"metric": "memory_percent", "direction": "decrease", "optional": true},
+        {"log_absent": ["out of memory", "oomkilled"], "optional": true}
+      ],
+      "safe_actions": [
+        {
+          "action_type": "gitops_scale_deployment",
+          "conditions": [
+            {"path": "incident.config_management", "equals": "gitops"},
+            {"path": "pod_status.replicas", "lte": 1}
+          ],
+          "params": {"replicas": 2},
+          "reason": "Increase replicas through GitOps because this workload is config-managed."
+        },
+        {
+          "action_type": "scale_deployment",
+          "conditions": [{"path": "pod_status.replicas", "lte": 1}],
+          "params": {"replicas": 2},
+          "reason": "Reduce pressure on the single crashing replica."
+        },
+        {
+          "action_type": "restart_pod",
+          "conditions": [],
+          "reason": "Clear the unstable pod after crash evidence was confirmed."
+        }
+      ]
+    },
+    {
+      "incident_type": "Service503",
+      "summary": "The service is returning 503 because dependencies are timing out or the workload is not healthy.",
+      "keywords": ["503", "upstream timeout", "dependency failure", "unavailable", "gateway", "health check"],
+      "runbook_files": ["04_service_503_upstream_down.md"],
+      "discriminating_tools": ["get_metrics", "get_pod_logs", "get_pod_status", "query_prometheus", "query_loki", "get_recent_deploys", "query_tempo"],
+      "confirmation_rules": [
+        {
+          "rule_id": "svc503_logs_and_error_rate",
+          "all": [
+            {"path": "logs_tail", "contains": "503"},
+            {"path": "logs_tail", "contains": "upstream"},
+            {"path": "metrics.error_rate_percent", "gte": 5}
+          ],
+          "confidence": 0.91,
+          "citations": ["tool:get_pod_logs", "tool:get_metrics"],
+          "reason": "Upstream timeout logs plus elevated error rate confirm the 503 incident."
+        },
+        {
+          "rule_id": "svc503_trace_dependency",
+          "all": [
+            {"path": "trace_context", "contains": "timeout"},
+            {"path": "metrics.p95_latency_ms", "gte": 1000}
+          ],
+          "confidence": 0.83,
+          "citations": ["tool:query_tempo", "tool:get_metrics"],
+          "reason": "Trace errors and elevated latency point to a dependency-driven 503 incident."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "error_rate_percent", "direction": "decrease"},
+        {"metric": "p95_latency_ms", "direction": "decrease", "optional": true},
+        {"log_absent": ["503", "upstream timeout"], "optional": true}
+      ],
+      "safe_actions": [
+        {"action_type": "restart_pod", "conditions": [], "reason": "Restart the unhealthy pod after upstream timeout evidence was confirmed."}
+      ]
+    },
+    {
+      "incident_type": "DNSFailure",
+      "summary": "The workload cannot resolve names because cluster DNS or upstream resolution is degraded.",
+      "keywords": ["dns", "nxdomain", "could not resolve", "resolver", "coredns"],
+      "runbook_files": ["05_dns_resolution_failures.md"],
+      "discriminating_tools": ["get_pod_logs", "get_cluster_events", "get_metrics", "get_pod_status", "query_loki", "query_prometheus"],
+      "confirmation_rules": [
+        {
+          "rule_id": "dns_logs_and_metrics",
+          "all": [
+            {"path": "logs_tail", "contains_any": ["nxdomain", "could not resolve"]},
+            {"path": "metrics.dns_error_rate_percent", "gte": 5}
+          ],
+          "confidence": 0.9,
+          "citations": ["tool:get_pod_logs", "tool:get_metrics"],
+          "reason": "Resolver errors in logs and DNS error metrics both point to cluster DNS failure."
+        },
+        {
+          "rule_id": "dns_logs_and_events",
+          "all": [
+            {"path": "logs_tail", "contains_any": ["nxdomain", "could not resolve"]},
+            {"path": "cluster_events", "contains": "dns"}
+          ],
+          "confidence": 0.86,
+          "citations": ["tool:get_pod_logs", "tool:get_cluster_events"],
+          "reason": "Resolver errors and DNS-related cluster events corroborate the incident."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "dns_error_rate_percent", "direction": "decrease"},
+        {"metric": "error_rate_percent", "direction": "decrease", "optional": true},
+        {"log_absent": ["nxdomain", "could not resolve"], "optional": true}
+      ],
+      "safe_actions": [
+        {"action_type": "restart_coredns", "conditions": [], "reason": "Recover cluster DNS after repeated resolution failures."}
+      ]
+    },
+    {
+      "incident_type": "HighCPU",
+      "summary": "CPU saturation or throttling is increasing latency and errors.",
+      "keywords": ["cpu", "throttling", "latency", "hot path", "slow"],
+      "runbook_files": ["02_high_cpu_throttling.md"],
+      "discriminating_tools": ["get_metrics", "get_pod_status", "get_pod_logs", "query_prometheus", "get_recent_deploys"],
+      "confirmation_rules": [
+        {
+          "rule_id": "cpu_high_and_latency",
+          "all": [
+            {"path": "metrics.cpu_percent", "gte": 85},
+            {"path": "metrics.p95_latency_ms", "gte": 1000}
+          ],
+          "confidence": 0.82,
+          "citations": ["tool:get_metrics"],
+          "reason": "CPU saturation and high latency indicate a compute bottleneck."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "cpu_percent", "direction": "decrease"},
+        {"metric": "p95_latency_ms", "direction": "decrease"}
+      ],
+      "safe_actions": [
+        {"action_type": "scale_deployment", "conditions": [], "params": {"replicas": 2}, "reason": "Spread traffic while CPU saturation is investigated."}
+      ]
+    },
+    {
+      "incident_type": "HighMemory",
+      "summary": "Memory usage rises and the workload is at risk of OOM or degraded latency.",
+      "keywords": ["memory", "rss", "heap", "leak", "oom"],
+      "runbook_files": ["03_high_memory_leak.md", "01_crashloopbackoff_oomkilled.md"],
+      "discriminating_tools": ["get_metrics", "get_pod_logs", "describe_pod", "get_recent_deploys"],
+      "confirmation_rules": [
+        {
+          "rule_id": "memory_trend_and_logs",
+          "all": [
+            {"path": "metrics.memory_percent", "gte": 85},
+            {"path": "logs_tail", "contains_any": ["memory", "heap", "oom"]}
+          ],
+          "confidence": 0.81,
+          "citations": ["tool:get_metrics", "tool:get_pod_logs"],
+          "reason": "Memory saturation combined with memory-related logs indicates a leak or pressure event."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "memory_percent", "direction": "decrease"}
+      ],
+      "safe_actions": [
+        {"action_type": "scale_deployment", "conditions": [], "params": {"replicas": 2}, "reason": "Reduce per-pod memory pressure while the leak is investigated."}
+      ]
+    },
+    {
+      "incident_type": "DeploymentRegression",
+      "summary": "A recent deploy correlates with the incident and rollback or redeploy may be safer than ad hoc mutation.",
+      "keywords": ["deploy", "release", "new version", "regression", "rollback"],
+      "runbook_files": ["12_deployment_regression_recent_release.md", "04_service_503_upstream_down.md"],
+      "discriminating_tools": ["get_recent_deploys", "get_pod_logs", "query_prometheus", "get_dashboard_context", "get_incident_history"],
+      "confirmation_rules": [
+        {
+          "rule_id": "recent_deploy_and_errors",
+          "all": [
+            {"path": "recent_deploys[0].minutes_ago", "lte": 30},
+            {"path": "metrics.error_rate_percent", "gte": 5}
+          ],
+          "confidence": 0.76,
+          "citations": ["tool:get_recent_deploys", "tool:get_metrics"],
+          "reason": "Error rate rose shortly after the latest deploy."
+        },
+        {
+          "rule_id": "historical_rollback_match",
+          "all": [
+            {"path": "incident_history", "contains": "DeploymentRegression"},
+            {"path": "recent_deploys[0].minutes_ago", "lte": 60}
+          ],
+          "confidence": 0.72,
+          "citations": ["tool:get_incident_history", "tool:get_recent_deploys"],
+          "reason": "Service history shows prior release regressions and the latest deploy is recent."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "error_rate_percent", "direction": "decrease"}
+      ],
+      "safe_actions": [
+        {"action_type": "restart_pod", "conditions": [], "reason": "Use restart as a reversible stopgap while a rollback decision is made."}
+      ]
+    },
+    {
+      "incident_type": "DatabaseConnectionFailure",
+      "summary": "Application calls fail because the database connection path is degraded.",
+      "keywords": ["database", "connection refused", "pool timeout", "too many clients", "sqlstate", "postgres"],
+      "runbook_files": ["06_database_connection_failures.md"],
+      "discriminating_tools": ["get_pod_logs", "query_tempo", "get_recent_deploys", "get_service_owner", "get_incident_history"],
+      "confirmation_rules": [
+        {
+          "rule_id": "db_connection_logs",
+          "all": [
+            {"path": "logs_tail", "contains_any": ["connection refused", "too many clients", "timeout acquiring db connection"]}
+          ],
+          "confidence": 0.88,
+          "citations": ["tool:get_pod_logs"],
+          "reason": "Database-specific connection errors are present in logs."
+        },
+        {
+          "rule_id": "db_dependency_trace",
+          "all": [
+            {"path": "trace_context", "contains_any": ["database", "sql", "payments-db"]},
+            {"path": "trace_context", "contains_any": ["timeout", "error"]}
+          ],
+          "confidence": 0.8,
+          "citations": ["tool:query_tempo"],
+          "reason": "Trace spans show failing database dependency calls."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "error_rate_percent", "direction": "decrease", "optional": true},
+        {"log_absent": ["connection refused", "too many clients", "timeout acquiring db connection"], "optional": true}
+      ],
+      "safe_actions": [
+        {"action_type": "restart_pod", "conditions": [], "reason": "Restart the caller pod to clear a stuck connection pool while DB owners investigate."}
+      ]
+    },
+    {
+      "incident_type": "TLSCertificateExpiry",
+      "summary": "Requests fail because certificate validity or trust configuration is broken.",
+      "keywords": ["certificate expired", "x509", "tls handshake", "ssl", "trust chain"],
+      "runbook_files": ["07_tls_certificate_expiry.md"],
+      "discriminating_tools": ["get_pod_logs", "get_recent_deploys", "get_dashboard_context", "get_service_owner"],
+      "confirmation_rules": [
+        {
+          "rule_id": "tls_x509_logs",
+          "all": [
+            {"path": "logs_tail", "contains_any": ["certificate expired", "x509", "tls handshake failed"]}
+          ],
+          "confidence": 0.9,
+          "citations": ["tool:get_pod_logs"],
+          "reason": "TLS and x509 failure messages indicate a certificate lifecycle issue."
+        }
+      ],
+      "verification_rules": [
+        {"log_absent": ["certificate expired", "x509", "tls handshake failed"], "optional": true},
+        {"metric": "error_rate_percent", "direction": "decrease", "optional": true}
+      ],
+      "safe_actions": [
+        {"action_type": "restart_pod", "conditions": [], "reason": "Reload the pod only after the certificate rotation path has been validated by a human."}
+      ]
+    },
+    {
+      "incident_type": "NodeNotReady",
+      "summary": "Infrastructure instability on one or more nodes is degrading multiple workloads.",
+      "keywords": ["node not ready", "taint", "kubelet", "evicted", "scheduling"],
+      "runbook_files": ["08_node_not_ready.md"],
+      "discriminating_tools": ["get_cluster_events", "get_pod_status", "get_metrics", "get_recent_deploys"],
+      "confirmation_rules": [
+        {
+          "rule_id": "node_not_ready_events",
+          "all": [
+            {"path": "cluster_events", "contains_any": ["NodeNotReady", "taint", "evict"]}
+          ],
+          "confidence": 0.86,
+          "citations": ["tool:get_cluster_events"],
+          "reason": "Cluster events show a node readiness or scheduling problem."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "error_rate_percent", "direction": "decrease", "optional": true},
+        {"metric": "p95_latency_ms", "direction": "decrease", "optional": true}
+      ],
+      "safe_actions": [
+        {"action_type": "scale_deployment", "conditions": [], "params": {"replicas": 2}, "reason": "Temporarily spread workload while platform SREs repair the node."}
+      ]
+    },
+    {
+      "incident_type": "DiskPressure",
+      "summary": "Storage saturation is degrading the workload or causing evictions.",
+      "keywords": ["disk pressure", "no space left", "storage", "io error", "evict"],
+      "runbook_files": ["09_disk_pressure.md"],
+      "discriminating_tools": ["get_cluster_events", "get_pod_logs", "get_recent_deploys", "get_incident_history"],
+      "confirmation_rules": [
+        {
+          "rule_id": "disk_pressure_logs_and_events",
+          "all": [
+            {"path": "cluster_events", "contains_any": ["DiskPressure", "evict"]},
+            {"path": "logs_tail", "contains_any": ["no space left", "disk"]}
+          ],
+          "confidence": 0.85,
+          "citations": ["tool:get_cluster_events", "tool:get_pod_logs"],
+          "reason": "Disk pressure events and storage failure logs point to node or workload storage exhaustion."
+        }
+      ],
+      "verification_rules": [
+        {"log_absent": ["no space left"], "optional": true},
+        {"metric": "error_rate_percent", "direction": "decrease", "optional": true}
+      ],
+      "safe_actions": [
+        {"action_type": "restart_pod", "conditions": [], "reason": "Restart the noisiest pod only as a temporary relief step while storage owners investigate."}
+      ]
+    },
+    {
+      "incident_type": "QueueBacklog",
+      "summary": "Background work is accumulating because consumers are too slow or stuck.",
+      "keywords": ["queue depth", "backlog", "worker lag", "consumer slow", "drain"],
+      "runbook_files": ["10_queue_backlog_worker_lag.md"],
+      "discriminating_tools": ["get_dashboard_context", "get_metrics", "query_tempo", "get_recent_deploys", "get_incident_history", "get_pod_logs"],
+      "confirmation_rules": [
+        {
+          "rule_id": "queue_depth_and_latency",
+          "all": [
+            {"path": "dashboard_context.panels", "contains": "queue_depth"},
+            {"path": "metrics.p95_latency_ms", "gte": 1000}
+          ],
+          "confidence": 0.72,
+          "citations": ["tool:get_dashboard_context", "tool:get_metrics"],
+          "reason": "Queue dashboard context plus rising latency suggest worker lag or backlog."
+        },
+        {
+          "rule_id": "queue_logs_and_traces",
+          "all": [
+            {"path": "logs_tail", "contains_any": ["backlog", "retrying job", "queue depth"]},
+            {"path": "trace_context", "contains_any": ["timeout", "queue", "worker"]}
+          ],
+          "confidence": 0.79,
+          "citations": ["tool:get_pod_logs", "tool:query_tempo"],
+          "reason": "Worker logs and traces both point to queue processing lag."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "p95_latency_ms", "direction": "decrease", "optional": true},
+        {"metric": "error_rate_percent", "direction": "decrease", "optional": true}
+      ],
+      "safe_actions": [
+        {"action_type": "scale_deployment", "conditions": [], "params": {"replicas": 3}, "reason": "Scale worker capacity to drain the backlog."}
+      ]
+    },
+    {
+      "incident_type": "DependencyLatency",
+      "summary": "A downstream dependency is slow enough to degrade this service even before hard failures appear.",
+      "keywords": ["dependency latency", "timeout", "upstream slow", "p95", "span"],
+      "runbook_files": ["11_dependency_latency_spike.md", "04_service_503_upstream_down.md"],
+      "discriminating_tools": ["query_tempo", "get_pod_logs", "get_metrics", "get_recent_deploys"],
+      "confirmation_rules": [
+        {
+          "rule_id": "dependency_trace_latency",
+          "all": [
+            {"path": "trace_context", "contains_any": ["timeout", "deadline exceeded"]},
+            {"path": "metrics.p95_latency_ms", "gte": 1200}
+          ],
+          "confidence": 0.84,
+          "citations": ["tool:query_tempo", "tool:get_metrics"],
+          "reason": "Dependency trace failures and high p95 latency indicate an upstream slowdown."
+        }
+      ],
+      "verification_rules": [
+        {"metric": "p95_latency_ms", "direction": "decrease"},
+        {"metric": "error_rate_percent", "direction": "decrease", "optional": true}
+      ],
+      "safe_actions": [
+        {"action_type": "restart_pod", "conditions": [], "reason": "Restart a wedged caller pod while dependency owners investigate the slowdown."}
+      ]
+    }
+  ]
+}

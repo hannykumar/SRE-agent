@@ -1,6 +1,6 @@
 # SRE Copilot
 
-> **Publication status:** This README describes the September 2026 local rebuild. The corresponding application changes and supporting documents have not yet been published to this branch; the commands and file references below apply to that rebuild. Final authenticated browser verification remains pending.
+> **Publication status:** This README describes the September 2026 local rebuild. The corresponding application changes and supporting documents have not yet been published to this branch; the commands and file references below apply to that rebuild. Final authenticated recovery-screen verification passed on September 17, 2026.
 
 An evidence-grounded incident investigation and human-approved remediation workbench. A master's portfolio project using Kubernetes, Grafana, Prometheus, Loki, LangGraph and a local LLM.
 

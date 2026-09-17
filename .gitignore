@@ -29,18 +29,15 @@ htmlcov/
 .vscode/
 
 # Local runtime data
-ops.db
+runtime.db
 *.db
 *.sqlite
 *.sqlite3
 artifacts/
 traces/
-ops_runs/
 eval_history/
 eval_results.json
 archive/
-qdrant_data/
-docker/qdrant_data/
 data/mock_live_state/
 data/gitops_repo/_changes/
 

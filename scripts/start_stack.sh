@@ -1,7 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export DATABASE_URL="${DATABASE_URL:-sqlite:///./ops.db}"
+cd "$(dirname "$0")/.."
+if [[ -x .venv/bin/python ]]; then
+  export PATH="$PWD/.venv/bin:$PATH"
+fi
+
+if [[ "${1:-}" == "--llm" ]]; then
+  export SRE_AGENT_PLANNER_PROVIDER=ollama
+  export SRE_AGENT_PLANNER_MODEL="${SRE_AGENT_PLANNER_MODEL:-llama3.2:1b}"
+  export SRE_AGENT_PLANNER_TIMEOUT_SECONDS="${SRE_AGENT_PLANNER_TIMEOUT_SECONDS:-90}"
+  export SRE_AGENT_PLANNER_MAX_RETRIES="${SRE_AGENT_PLANNER_MAX_RETRIES:-0}"
+  export SRE_MAX_ASYNC_WORKERS=1
+elif [[ -n "${1:-}" ]]; then
+  printf 'Usage: bash scripts/start_stack.sh [--llm]\n' >&2
+  exit 2
+fi
+
+export DATABASE_URL="${DATABASE_URL:-sqlite:///./runtime.db}"
 export EXECUTOR_BASE_URL="${EXECUTOR_BASE_URL:-http://127.0.0.1:8091}"
 export OPS_API_TOKENS="${OPS_API_TOKENS:-}"
 export SRE_DEFAULT_API_TOKEN="${SRE_DEFAULT_API_TOKEN:-}"
@@ -13,11 +29,11 @@ export GITOPS_REPO_DIR="${GITOPS_REPO_DIR:-data/gitops_repo}"
 # Start a local executor only when the configured executor points back to this machine.
 EXECUTOR_PID=""
 if [[ "$EXECUTOR_BASE_URL" == "http://127.0.0.1:8091" || "$EXECUTOR_BASE_URL" == "http://localhost:8091" ]]; then
-  PYTHONPATH=. uvicorn executor.api:app --host 0.0.0.0 --port 8091 &
+  PYTHONPATH=. uvicorn executor.api:app --host "${SRE_BIND_HOST:-127.0.0.1}" --port 8091 &
   EXECUTOR_PID=$!
 fi
 
-PYTHONPATH=. uvicorn ops.api:app --host 0.0.0.0 --port 8090 &
+PYTHONPATH=. uvicorn runtime.api:app --host "${SRE_BIND_HOST:-127.0.0.1}" --port 8090 &
 API_PID=$!
 
 cleanup() {
@@ -29,4 +45,5 @@ cleanup() {
 
 trap cleanup EXIT
 
-PYTHONPATH=. streamlit run ui/app.py --server.address 0.0.0.0 --server.port 8501
+printf 'SRE Copilot: http://localhost:8090\n'
+wait "$API_PID"

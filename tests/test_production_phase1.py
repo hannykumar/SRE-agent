@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib
 from pathlib import Path
 from typing import Any, Dict, List
@@ -7,13 +8,13 @@ from typing import Any, Dict, List
 from fastapi.testclient import TestClient
 
 import agent.langgraph_agent as lg
-import ops.api as api_module
+import runtime.api as api_module
 from executor.schemas import ExecutionRequest
 from executor.service import ExecutionService
-from mcp_tools.mock_mcp import MockMCP
-from ops.db import init_db, reset_db_state
-from ops.settings import reset_settings_cache
-from ops.storage import get_execution_by_id, get_latest_rollback, list_audit_events
+from integrations.mock_mcp import MockMCP
+from runtime.db import init_db, reset_db_state
+from runtime.settings import reset_settings_cache
+from runtime.storage import get_execution_by_id, get_latest_rollback, list_audit_events
 
 
 def _fake_retrieval(_query: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -24,6 +25,18 @@ def _fake_retrieval(_query: str, limit: int = 8) -> List[Dict[str, Any]]:
             "incident_type": "CrashLoopBackOff",
             "section": "Symptoms",
             "text": "OOMKilled and CrashLoopBackOff observed",
+        }
+    ][:limit]
+
+
+def _fake_service503_retrieval(_query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    return [
+        {
+            "score": 1.0,
+            "source_file": "04_service_503_upstream_down.md",
+            "incident_type": "Service503",
+            "section": "Symptoms",
+            "text": "HTTP 503 responses and an unavailable payments upstream are observed.",
         }
     ][:limit]
 
@@ -86,21 +99,21 @@ def test_executor_service_records_execution_and_rollback(monkeypatch, tmp_path: 
 
 def test_api_plan_and_execute_use_database_storage(monkeypatch, tmp_path: Path) -> None:
     _configure_test_environment(monkeypatch, tmp_path)
-    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_retrieval)
+    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_service503_retrieval)
 
     api = importlib.reload(api_module)
     client = TestClient(api.app)
 
     plan_response = client.post(
         "/runs/plan",
-        json={"incident_id": "INC-001"},
+        json={"incident_id": "INC-002"},
         headers=_headers("operator-token"),
     )
     assert plan_response.status_code == 200
     plan_payload = plan_response.json()
     run_id = plan_payload["run_id"]
     assert plan_payload["status"] == "awaiting_approval"
-    assert plan_payload["plan_result"]["diagnosis"] == "CrashLoopBackOff"
+    assert plan_payload["plan_result"]["diagnosis"] == "Service503"
     assert plan_payload["request"]["execution_mode"] == "preview"
     assert plan_payload["request"]["tool_mode"] == "mcp"
 
@@ -131,14 +144,25 @@ def test_api_plan_and_execute_use_database_storage(monkeypatch, tmp_path: Path) 
 
 def test_approve_execute_can_override_loaded_run_to_live(monkeypatch, tmp_path: Path) -> None:
     _configure_test_environment(monkeypatch, tmp_path)
-    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_retrieval)
+    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_service503_retrieval)
+
+    class _Executor:
+        def execute(self, _payload: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "status": "completed",
+                "execution_results": [{"status": "ok", "tool": "execute_remediation"}],
+                "verification": {"status": "resolved", "resolved": True},
+                "improved": True,
+            }
+
+    monkeypatch.setattr("runtime.job_runner.ExecutorClient", lambda: _Executor())
 
     api = importlib.reload(api_module)
     client = TestClient(api.app)
 
     plan_response = client.post(
         "/runs/plan",
-        json={"incident_id": "INC-001"},
+        json={"incident_id": "INC-002"},
         headers=_headers("operator-token"),
     )
     assert plan_response.status_code == 200
@@ -158,15 +182,15 @@ def test_approve_execute_can_override_loaded_run_to_live(monkeypatch, tmp_path: 
 
 def test_api_rbac_blocks_unauthorized_actions(monkeypatch, tmp_path: Path) -> None:
     _configure_test_environment(monkeypatch, tmp_path)
-    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_retrieval)
+    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_service503_retrieval)
 
     api = importlib.reload(api_module)
     client = TestClient(api.app)
 
-    viewer_plan = client.post("/runs/plan", json={"incident_id": "INC-001"}, headers=_headers("viewer-token"))
+    viewer_plan = client.post("/runs/plan", json={"incident_id": "INC-002"}, headers=_headers("viewer-token"))
     assert viewer_plan.status_code == 403
 
-    operator_plan = client.post("/runs/plan", json={"incident_id": "INC-001"}, headers=_headers("operator-token"))
+    operator_plan = client.post("/runs/plan", json={"incident_id": "INC-002"}, headers=_headers("operator-token"))
     assert operator_plan.status_code == 200
     run_id = operator_plan.json()["run_id"]
 
@@ -178,3 +202,23 @@ def test_api_rbac_blocks_unauthorized_actions(monkeypatch, tmp_path: Path) -> No
 
     missing_token = client.get(f"/runs/{run_id}")
     assert missing_token.status_code == 401
+
+
+def test_mock_mcp_partial_recovery_profile_only_partially_improves() -> None:
+    base = copy.deepcopy(MockMCP("INC-002").data)
+    base["recovery_profile"] = "partial"
+    MockMCP.seed_live_state("INC-002-partial", base)
+
+    client = MockMCP("INC-002-partial", allow_write=True)
+    before_error_rate = float(client.data["metrics"]["error_rate_percent"])
+    before_latency = float(client.data["metrics"]["p95_latency_ms"])
+
+    client.restart_pod(service="api", namespace="prod")
+
+    after_error_rate = float(client.data["metrics"]["error_rate_percent"])
+    after_latency = float(client.data["metrics"]["p95_latency_ms"])
+
+    assert after_error_rate < before_error_rate
+    assert after_error_rate > 0
+    assert after_latency < before_latency
+    assert "remain" in " ".join(client.data["logs_tail"]).lower()

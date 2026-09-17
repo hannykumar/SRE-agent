@@ -6,7 +6,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List
 
-CATALOG_PATH = Path("catalog/incident_catalog.json")
+CATALOG_PATH = Path("config/catalog/incident_catalog.json")
+PRODUCTION_READ_TOOLS = [
+    "get_deployment",
+    "get_kubernetes_events",
+    "query_prometheus_range",
+    "query_loki_range",
+    "get_git_diff",
+    "get_service_dependencies",
+    "search_runbooks",
+    "search_previous_incidents",
+]
 
 
 @dataclass(frozen=True)
@@ -67,6 +77,9 @@ def allowed_catalog_tools() -> List[str]:
         for tool_name in definition.discriminating_tools:
             if tool_name not in tools:
                 tools.append(tool_name)
+    for tool_name in PRODUCTION_READ_TOOLS:
+        if tool_name not in tools:
+            tools.append(tool_name)
     return tools
 
 

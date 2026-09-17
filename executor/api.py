@@ -4,8 +4,8 @@ from fastapi import FastAPI, Header, HTTPException
 
 from executor.schemas import ExecutionRequest, RollbackRequest
 from executor.service import ExecutionService
-from ops.db import init_db
-from ops.settings import get_settings
+from runtime.db import init_db
+from runtime.settings import get_settings
 
 app = FastAPI(title="sre-executor-service")
 init_db()

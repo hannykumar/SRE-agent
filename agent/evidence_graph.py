@@ -68,12 +68,48 @@ def evaluate_rule(payload: Dict[str, Any], rule: Dict[str, Any]) -> bool:
     return False
 
 
+def _graph_source_metadata(source_type: str) -> Dict[str, Any]:
+    freshness = {
+        "alert": "current",
+        "tool": "current",
+        "specialist": "derived",
+        "runbook": "reference",
+        "service_memory": "historical",
+    }.get(source_type, "unknown")
+    reliability = {
+        "alert": 0.95,
+        "tool": 0.9,
+        "specialist": 0.75,
+        "runbook": 0.55,
+        "service_memory": 0.65,
+    }.get(source_type, 0.5)
+    return {"freshness": freshness, "source_reliability": reliability}
+
+
 def build_evidence_graph(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     nodes: List[Dict[str, Any]] = []
     counter = itertools.count(1)
+    ledger = list(state.get("evidence_ledger") or [])
 
     incident = state.get("incident", {})
-    if incident:
+    alert_entries = [item for item in ledger if item.get("kind") == "alert"]
+    if alert_entries:
+        entry = alert_entries[0]
+        nodes.append(
+            {
+                "evidence_id": str(entry.get("evidence_id") or "E000"),
+                "source_type": "alert",
+                "evidence_kind": "AlertEvidence",
+                "source_name": str(entry.get("source") or "alert_webhook"),
+                "summary": str(incident.get("description", "")),
+                "path": "incident.description",
+                "observed_at": entry.get("observed_at", ""),
+                "status": entry.get("status", "ok"),
+                "freshness": entry.get("freshness", "current"),
+                "source_reliability": entry.get("source_reliability", 0.95),
+            }
+        )
+    elif incident:
         nodes.append(
             {
                 "evidence_id": f"A{next(counter)}",
@@ -82,6 +118,7 @@ def build_evidence_graph(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "source_name": "incident.description",
                 "summary": str(incident.get("description", "")),
                 "path": "incident.description",
+                **_graph_source_metadata("alert"),
             }
         )
 
@@ -95,6 +132,7 @@ def build_evidence_graph(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "source_name": str(service_memory.get("service", "")),
                 "summary": str(service_memory.get("summary", ""))[:280],
                 "path": "service_memory",
+                **_graph_source_metadata("service_memory"),
             }
         )
 
@@ -108,21 +146,43 @@ def build_evidence_graph(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "summary": f"{chunk.get('section', '')}: {str(chunk.get('text', ''))[:220]}",
                 "path": f"top_chunks[{idx - 1}]",
                 "incident_type": chunk.get("incident_type"),
+                **_graph_source_metadata("runbook"),
             }
         )
 
-    tool_results = state.get("tool_results", {}) or {}
-    for idx, (tool_name, observation) in enumerate(tool_results.items(), start=1):
-        nodes.append(
-            {
-                "evidence_id": f"T{idx}",
-                "source_type": "tool",
-                "evidence_kind": "ToolEvidence",
-                "source_name": tool_name,
-                "summary": _joined_value(observation)[:280],
-                "path": f"tool_results.{tool_name}",
-            }
-        )
+    tool_entries = [item for item in ledger if item.get("kind") == "tool_observation"]
+    if tool_entries:
+        for entry in tool_entries:
+            tool_name = str(entry.get("tool") or "unknown_tool")
+            nodes.append(
+                {
+                    "evidence_id": str(entry.get("evidence_id")),
+                    "source_type": "tool",
+                    "evidence_kind": "ToolEvidence",
+                    "source_name": tool_name,
+                    "summary": _joined_value(entry.get("payload"))[:280],
+                    "path": f"tool_results.{tool_name}",
+                    "observed_at": entry.get("observed_at", ""),
+                    "time_range": entry.get("time_range", {}),
+                    "status": entry.get("status", "ok"),
+                    "freshness": entry.get("freshness", "current"),
+                    "source_reliability": entry.get("source_reliability", 0.9),
+                }
+            )
+    else:
+        tool_results = state.get("tool_results", {}) or {}
+        for idx, (tool_name, observation) in enumerate(tool_results.items(), start=1):
+            nodes.append(
+                {
+                    "evidence_id": f"T{idx}",
+                    "source_type": "tool",
+                    "evidence_kind": "ToolEvidence",
+                    "source_name": tool_name,
+                    "summary": _joined_value(observation)[:280],
+                    "path": f"tool_results.{tool_name}",
+                    **_graph_source_metadata("tool"),
+                }
+            )
 
     for idx, finding in enumerate(state.get("specialist_findings", []) or [], start=1):
         nodes.append(
@@ -133,6 +193,7 @@ def build_evidence_graph(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "source_name": str(finding.get("specialist", "")),
                 "summary": str(finding.get("summary", ""))[:280],
                 "path": f"specialist_findings[{idx - 1}]",
+                **_graph_source_metadata("specialist"),
             }
         )
 
@@ -141,7 +202,10 @@ def build_evidence_graph(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def citation_index(state: Dict[str, Any]) -> Dict[str, List[str]]:
     mapping: Dict[str, List[str]] = {}
-    for node in build_evidence_graph(state):
+    graph = list(state.get("evidence_graph") or [])
+    if not graph:
+        graph = build_evidence_graph(state)
+    for node in graph:
         path = str(node.get("path", ""))
         source_name = str(node.get("source_name", ""))
         evidence_id = str(node.get("evidence_id", ""))
@@ -150,7 +214,7 @@ def citation_index(state: Dict[str, Any]) -> Dict[str, List[str]]:
             mapping.setdefault(f"tool:{source_name}", []).append(evidence_id)
             mapping.setdefault(f"runbook:{source_name}", []).append(evidence_id)
             mapping.setdefault(f"specialist:{source_name}", []).append(evidence_id)
-    mapping.setdefault("alert:summary", [node["evidence_id"] for node in build_evidence_graph(state) if node.get("source_type") == "alert"])
+    mapping.setdefault("alert:summary", [node["evidence_id"] for node in graph if node.get("source_type") == "alert"])
     return mapping
 
 
@@ -164,7 +228,7 @@ def rank_diagnoses(state: Dict[str, Any]) -> List[Dict[str, Any]]:
         "cluster_events": (state.get("evidence") or {}).get("cluster_events", []),
         "prometheus": (state.get("tool_results") or {}).get("query_prometheus", {}),
         "loki": (state.get("tool_results") or {}).get("query_loki", {}),
-        "recent_deploys": (state.get("tool_results") or {}).get("get_recent_deploys", []),
+        "recent_deploys": (state.get("evidence") or {}).get("recent_deploys", []),
         "dashboard_context": (state.get("tool_results") or {}).get("get_dashboard_context", {}),
         "trace_context": (state.get("tool_results") or {}).get("query_tempo", []),
         "service_owner": (state.get("tool_results") or {}).get("get_service_owner", {}),

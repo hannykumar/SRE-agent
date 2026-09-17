@@ -22,27 +22,43 @@ from uuid import uuid4
 from langgraph.graph import END, StateGraph
 
 from agent.deterministic_policy import (
+    ensure_tool_prerequisites,
     evidence_from_tools,
     summarize_observation,
     tool_args_for,
 )
 from agent.evidence_graph import build_evidence_graph, rank_diagnoses
+from agent.evidence_ledger import (
+    alert_evidence,
+    evaluate_evidence_gate,
+    hypothesis_snapshot,
+    tool_evidence,
+    validated_model_hypotheses,
+)
 from agent.incident_catalog import catalog_version
+from agent.incident_context import incident_payload_from_context
+from agent.grounding import build_grounded_report
 from agent.model_runtime import passive_model_status
 from agent.planner import normalize_action_from_decision, plan_next_step
 from agent.prompts import SYSTEM_PROMPT, UNKNOWN_ESCALATION_OUTPUT
 from agent.retrieval import build_retry_query, retrieve_runbook_chunks, summarize_retrieval_context
+from agent.run_summaries import (
+    build_approval_summary,
+    build_handoff_summary,
+    build_incident_brief,
+    build_verification_summary,
+)
 from agent.service_memory import enabled_integrations_summary, load_service_memory
 from agent.specialists import build_specialist_findings, coordinate_specialist_findings
 from agent.state import AgentState
 from executor.client import ExecutorClient
-from mcp_tools.actions import render_action_to_command, rollback_command_for_action
-from mcp_tools.mock_mcp import MockMCP
-from mcp_tools.tool_gateway import get_tool_client
-from ops.artifacts import save_run_artifacts
-from ops.metrics import PLANNER_DURATION, RETRIEVAL_DURATION, TOOL_DURATION, observe_duration
-from ops.settings import get_settings
-from tracing.trace_recorder import create_trace
+from integrations.actions import render_action_to_command, rollback_command_for_action
+from integrations.mock_mcp import MockMCP
+from integrations.tool_gateway import get_tool_client
+from runtime.artifacts import save_run_artifacts
+from runtime.metrics import PLANNER_DURATION, RETRIEVAL_DURATION, TOOL_DURATION, observe_duration
+from runtime.settings import get_settings
+from agent.tracing import create_trace
 
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -120,7 +136,53 @@ def _evidence_domain_count(evidence: Dict[str, Any]) -> int:
         domains += 1
     if list(evidence.get("recent_deploys") or []):
         domains += 1
+    if dict(evidence.get("service_dependencies") or {}):
+        domains += 1
     return domains
+
+
+def _refresh_analysis(
+    state: AgentState,
+    *,
+    evidence: Dict[str, Any],
+    candidate_seed: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    seed_candidates = list(candidate_seed if candidate_seed is not None else (state.get("candidate_diagnoses") or []))
+    specialist_findings = build_specialist_findings(evidence, (state.get("service_memory") or {}).get("payload", {}))
+    seeded_state = {
+        **state,
+        "evidence": evidence,
+        "specialist_findings": specialist_findings,
+        "candidate_diagnoses": seed_candidates,
+    }
+    diagnosis_candidates = rank_diagnoses(seeded_state)
+    coordinator_summary = coordinate_specialist_findings(specialist_findings, diagnosis_candidates)
+    evidence_graph = build_evidence_graph(
+        {
+            **seeded_state,
+            "candidate_diagnoses": diagnosis_candidates,
+            "coordinator_summary": coordinator_summary,
+        }
+    )
+    return {
+        "specialist_findings": specialist_findings,
+        "coordinator_summary": coordinator_summary,
+        "evidence_graph": evidence_graph,
+        "candidate_diagnoses": diagnosis_candidates,
+    }
+
+
+def _finalize_operator_views(state: AgentState) -> Dict[str, Any]:
+    brief = build_incident_brief(state)
+    approval = build_approval_summary(state)
+    handoff = build_handoff_summary(state)
+    verification = build_verification_summary(state)
+    return {
+        "incident_brief": brief,
+        "approval_summary": approval,
+        "handoff_summary": handoff,
+        "verification_summary": verification,
+    }
 
 
 def build_final_response(state: AgentState) -> str:
@@ -128,27 +190,36 @@ def build_final_response(state: AgentState) -> str:
     if diagnosis == "Unknown" or not state.get("confirmed", False):
         return UNKNOWN_ESCALATION_OUTPUT
 
-    confidence = float(state.get("confidence", 0.0) or 0.0)
-    confidence_label = "High" if confidence >= 0.85 else "Medium" if confidence >= 0.6 else "Low"
-    command = state.get("planned_commands", ["(none)"])[0]
-    coordinator = dict(state.get("coordinator_summary") or {})
-    specialist_findings = list(state.get("specialist_findings") or [])
+    brief = dict(state.get("incident_brief") or build_incident_brief(state))
+    approval_summary = dict(state.get("approval_summary") or build_approval_summary(state))
+    planned_commands = list(state.get("planned_commands") or [])
     top_candidate = (state.get("candidate_diagnoses") or [{}])[0]
-    rationale = list(top_candidate.get("rationale") or [])[:3]
     citations = list(top_candidate.get("citations") or [])[:4]
     if not citations:
         citations = [str(node.get("evidence_id", "")) for node in list(state.get("evidence_graph") or [])[:4] if node.get("evidence_id")]
 
     lines = [
-        f"Diagnosis: {diagnosis}. Confidence: {confidence_label}.",
-        f"Coordinator summary: {coordinator.get('summary', 'The investigation gathered enough evidence to support this diagnosis.')}",
+        f"Diagnosis: {diagnosis}.",
+        brief.get("summary", "The investigation gathered enough evidence to support this diagnosis."),
     ]
-    if rationale:
-        lines.append("Why this diagnosis: " + " | ".join(rationale))
-    if specialist_findings:
-        lines.append("Specialists: " + " | ".join(item.get("summary", "") for item in specialist_findings[:3] if item.get("summary")))
-    lines.append(f"Proposed action: {command}")
-    lines.append("Execution still requires explicit human approval.")
+    lines.append(
+        "Coordinator summary: "
+        + str((state.get("coordinator_summary") or {}).get("summary") or "The investigation gathered enough evidence to support this diagnosis.")
+    )
+    if brief.get("top_evidence"):
+        lines.append("Top evidence: " + " | ".join(list(brief.get("top_evidence") or [])[:3]))
+    if brief.get("uncertainties"):
+        lines.append("Still unclear: " + " | ".join(list(brief.get("uncertainties") or [])[:2]))
+    if planned_commands:
+        lines.append(f"Proposed action: {planned_commands[0]}")
+        if approval_summary.get("why_this_action"):
+            lines.append("Why this action: " + str(approval_summary.get("why_this_action")))
+        lines.append("Execution still requires explicit human approval.")
+    else:
+        lines.append("No executable catalog action met the observed safety preconditions.")
+        lines.append("Recommended next step: hand off the evidence and diagnosis to the on-call SRE for a scoped repair decision.")
+    if brief.get("alternatives"):
+        lines.append("Other possibilities still visible: " + ", ".join(list(brief.get("alternatives") or [])[:2]))
     if citations:
         lines.append("Citations: " + ", ".join(citations))
     return "\n".join(lines)
@@ -200,9 +271,25 @@ def node_ingest(state: AgentState) -> Dict[str, Any]:
     integration_summary = enabled_integrations_summary()
     retrieval_limit = max(get_settings().retrieval_limit, 3)
     retrieval_started = time.perf_counter()
+    retrieval_enabled = state.get("evaluation_profile") != "llm_no_retrieval"
+    context = dict(incident.get("incident_context") or {})
+    labels = dict(context.get("labels") or {})
+    retrieval_query = " ".join(
+        item
+        for item in [
+            str(incident.get("title") or "").strip(),
+            str(incident.get("description") or "").strip(),
+            str(labels.get("scenario") or "").replace("_", " ").strip(),
+        ]
+        if item
+    )
     with observe_duration(RETRIEVAL_DURATION):
-        retrieved = _retrieve_chunks(str(incident["description"]), limit=retrieval_limit, incident=incident, evidence={})
-        retrieval = summarize_retrieval_context(str(incident["description"]), retrieved)
+        retrieved = (
+            _retrieve_chunks(retrieval_query, limit=retrieval_limit, incident=incident, evidence={})
+            if retrieval_enabled
+            else []
+        )
+        retrieval = summarize_retrieval_context(retrieval_query, retrieved, incident=incident)
     retrieval_ms = round((time.perf_counter() - retrieval_started) * 1000.0, 2)
     retrieved = retrieval["retrieved"]
     predicted_type = retrieval["predicted_type"]
@@ -234,24 +321,42 @@ def node_ingest(state: AgentState) -> Dict[str, Any]:
         "candidate_diagnoses": retrieval["candidate_diagnoses"],
         "predicted_type": predicted_type,
     }
-    evidence_graph = build_evidence_graph(initial_state)
-    initial_findings = build_specialist_findings({}, (service_memory or {}).get("payload", {}))
-    coordinator_summary = coordinate_specialist_findings(initial_findings, retrieval["candidate_diagnoses"])
+    analysis = _refresh_analysis(initial_state, evidence={}, candidate_seed=retrieval["candidate_diagnoses"])
+    initial_findings = analysis["specialist_findings"]
+    coordinator_summary = analysis["coordinator_summary"]
+    evidence_graph = analysis["evidence_graph"]
+    diagnosis_candidates = analysis["candidate_diagnoses"]
     investigation_activity = _build_investigation_activity(
         retrieval_summary=f"Retrieved {len(retrieved[:5])} grounded runbook chunks for the initial hypothesis.",
         coordinator_summary=coordinator_summary,
         next_step=f"Coordinator focus: {coordinator_summary.get('focus', 'metrics')}",
     )
-
+    seeded_state = {
+        **initial_state,
+        "diagnosis": diagnosis_candidates[0]["incident_type"] if diagnosis_candidates else predicted_type,
+        "confidence": float((diagnosis_candidates[0] if diagnosis_candidates else {}).get("score", 0.0) or 0.0),
+        "confirmed": False,
+        "evidence_graph": evidence_graph,
+        "specialist_findings": initial_findings,
+        "coordinator_summary": coordinator_summary,
+        "candidate_diagnoses": diagnosis_candidates,
+        "investigation_activity": investigation_activity,
+    }
+    initial_ledger = [alert_evidence(state["incident_context"])] if state.get("incident_context") else []
+    if initial_ledger:
+        evidence_graph = build_evidence_graph({**seeded_state, "evidence_ledger": initial_ledger})
+        seeded_state["evidence_graph"] = evidence_graph
+    operator_views = _finalize_operator_views(seeded_state)
     return {
         "incident": incident,
+        "service_memory": service_memory,
         "infrastructure_memory": service_memory,
         "retrieved": retrieved,
         "top_chunks": retrieved[:5],
         "retrieval_query": retrieval["query"],
         "retrieval_quality": retrieval["retrieval_quality"],
         "retrieval_attempts": 0,
-        "candidate_diagnoses": retrieval["candidate_diagnoses"],
+        "candidate_diagnoses": diagnosis_candidates,
         "predicted_type": predicted_type,
         "thought_summary": "",
         "escalation_reason": "",
@@ -275,10 +380,17 @@ def node_ingest(state: AgentState) -> Dict[str, Any]:
         "planned_commands": [],
         "rollback_commands": [],
         "evidence": {},
+        "evidence_ledger": initial_ledger,
+        "hypotheses": hypothesis_snapshot(diagnosis_candidates, evidence_graph),
+        "evidence_gate": evaluate_evidence_gate(diagnosis_candidates, evidence_graph),
         "evidence_graph": evidence_graph,
         "specialist_findings": initial_findings,
         "coordinator_summary": coordinator_summary,
         "investigation_activity": investigation_activity,
+        "incident_brief": operator_views["incident_brief"],
+        "approval_summary": operator_views["approval_summary"],
+        "handoff_summary": operator_views["handoff_summary"],
+        "verification_summary": operator_views["verification_summary"],
         "tool_confirmation_required": False,
         "tool_confirmation_prompt": "",
         "tool_confirmation_tool": "",
@@ -296,13 +408,29 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
 
     evidence = evidence_from_tools(state)
     planning_state = {**state, "step_count": step_count, "evidence": evidence}
-    specialist_findings = build_specialist_findings(evidence, (state.get("service_memory") or {}).get("payload", {}))
-    coordinator_summary = coordinate_specialist_findings(specialist_findings, state.get("candidate_diagnoses", []))
-    planning_state.update({"specialist_findings": specialist_findings, "coordinator_summary": coordinator_summary})
+    analysis = _refresh_analysis(planning_state, evidence=evidence)
+    specialist_findings = analysis["specialist_findings"]
+    coordinator_summary = analysis["coordinator_summary"]
+    diagnosis_candidates = analysis["candidate_diagnoses"]
+    evidence_graph = analysis["evidence_graph"]
+    hypotheses = hypothesis_snapshot(diagnosis_candidates, evidence_graph)
+    evidence_gate = evaluate_evidence_gate(diagnosis_candidates, evidence_graph)
+    planning_state.update(
+        {
+            "specialist_findings": specialist_findings,
+            "coordinator_summary": coordinator_summary,
+            "candidate_diagnoses": diagnosis_candidates,
+            "evidence_graph": evidence_graph,
+            "hypotheses": hypotheses,
+            "evidence_gate": evidence_gate,
+        }
+    )
     retrieval_attempts = int(state.get("retrieval_attempts", 0))
     retry_limit = max(get_settings().retrieval_retry_limit, 0)
     retrieval_limit = max(get_settings().retrieval_limit, 3)
     if (
+        state.get("evaluation_profile") != "llm_no_retrieval"
+        and
         step_count > 1
         and retrieval_attempts < retry_limit
         and (
@@ -315,7 +443,7 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
         retry_started = time.perf_counter()
         with observe_duration(RETRIEVAL_DURATION):
             retry_chunks = _retrieve_chunks(retry_query, limit=retrieval_limit, incident=state["incident"], evidence=evidence)
-            retry_retrieval = summarize_retrieval_context(retry_query, retry_chunks)
+            retry_retrieval = summarize_retrieval_context(retry_query, retry_chunks, incident=state["incident"])
         trace_add(
             state,
             "retrieval_retry",
@@ -340,35 +468,113 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
                 "latency_metrics": updated_latency,
             }
         )
-        coordinator_summary = coordinate_specialist_findings(specialist_findings, retry_retrieval["candidate_diagnoses"])
-        planning_state["coordinator_summary"] = coordinator_summary
+        analysis = _refresh_analysis(planning_state, evidence=evidence, candidate_seed=retry_retrieval["candidate_diagnoses"])
+        specialist_findings = analysis["specialist_findings"]
+        coordinator_summary = analysis["coordinator_summary"]
+        diagnosis_candidates = analysis["candidate_diagnoses"]
+        evidence_graph = analysis["evidence_graph"]
+        hypotheses = hypothesis_snapshot(diagnosis_candidates, evidence_graph)
+        evidence_gate = evaluate_evidence_gate(diagnosis_candidates, evidence_graph)
+        planning_state.update(
+            {
+                "specialist_findings": specialist_findings,
+                "coordinator_summary": coordinator_summary,
+                "candidate_diagnoses": diagnosis_candidates,
+                "evidence_graph": evidence_graph,
+                "hypotheses": hypotheses,
+                "evidence_gate": evidence_gate,
+            }
+        )
 
     planner_started = time.perf_counter()
     with observe_duration(PLANNER_DURATION):
         decision, planner_backend, planner_error = plan_next_step(planning_state)
-    analysis_state = {**planning_state, "specialist_findings": specialist_findings}
-    diagnosis_candidates = rank_diagnoses(analysis_state)
-    evidence_graph = build_evidence_graph(analysis_state)
+    model_hypotheses = validated_model_hypotheses(decision.hypotheses, evidence_graph)
+    if model_hypotheses:
+        hypotheses = model_hypotheses
+    situation_summary = decision.situation_summary.strip() or str(
+        (coordinator_summary or {}).get("summary") or state["incident"].get("description", "")
+    )
     thought = decision.thought_summary.strip()
     confidence = float(decision.confidence)
     diagnosis_name = decision.hypothesis.strip() or "Unknown"
     next_predicted_type = diagnosis_name if diagnosis_name != "Unknown" else planning_state.get("predicted_type", "Unknown")
     updated_latency = dict(planning_state.get("latency_metrics", {}))
     updated_latency["planner_ms"] = round((time.perf_counter() - planner_started) * 1000.0, 2)
+    evaluation_profile = str(state.get("evaluation_profile") or "hybrid_full")
+    tools_allowed = evaluation_profile not in {"llm_no_retrieval", "llm_rag"}
+    full_evidence_controls = evaluation_profile in {"", "hybrid_full", "deterministic_baseline"}
 
     append_message(state, "assistant", thought)
 
     retrieval_quality = dict(planning_state.get("retrieval_quality") or {})
     strong_evidence = _evidence_domain_count(evidence) >= 2
-    if (
-        decision.decision == "propose_action"
-        and diagnosis_name != "Unknown"
+    top_candidate = dict(diagnosis_candidates[0] if diagnosis_candidates else {})
+    close_second = False
+    if len(diagnosis_candidates) > 1:
+        close_second = abs(
+            float(diagnosis_candidates[0].get("score", 0.0) or 0.0)
+            - float(diagnosis_candidates[1].get("score", 0.0) or 0.0)
+        ) < 0.12
+    strong_rank = float(top_candidate.get("score", 0.0) or 0.0) >= 0.6 and not close_second
+    operator_views = _finalize_operator_views(
+        {
+            **planning_state,
+            "diagnosis": diagnosis_name,
+            "confidence": confidence,
+            "evidence_graph": evidence_graph,
+            "hypotheses": hypotheses,
+            "evidence_gate": evidence_gate,
+            "situation_summary": situation_summary,
+            "candidate_diagnoses": diagnosis_candidates,
+            "specialist_findings": specialist_findings,
+            "coordinator_summary": coordinator_summary,
+        }
+    )
+    claim_validation = build_grounded_report(
+        {
+            **planning_state,
+            "diagnosis": diagnosis_name,
+            "confirmed": diagnosis_name != "Unknown",
+            "evidence_graph": evidence_graph,
+            "candidate_diagnoses": diagnosis_candidates,
+            "hypotheses": hypotheses,
+            "situation_summary": situation_summary,
+        }
+    )["claim_validation"]
+    real_alert_controls = bool(full_evidence_controls and state.get("incident_context"))
+    evidence_strength_ok = (
+        bool(evidence_gate.get("passed")) and bool(claim_validation.get("critical_claims_supported"))
+        if real_alert_controls
+        else strong_evidence or float(retrieval_quality.get("overall", 0.0)) >= 0.72
+    )
+    diagnosis_supported = (
+        diagnosis_name != "Unknown"
+        and diagnosis_name == top_candidate.get("incident_type")
         and confidence >= MIN_CONFIDENCE_FOR_ACTION
-        and (strong_evidence or float(retrieval_quality.get("overall", 0.0)) >= 0.72)
-    ):
+        and strong_rank
+        and evidence_strength_ok
+    )
+    if decision.decision == "propose_action" and diagnosis_supported:
         proposed_action = normalize_action_from_decision(planning_state, decision)
         planned_command = render_action_to_command(proposed_action, state["incident"])
         rollback = rollback_command_for_action(proposed_action, state["incident"])
+        action_views = _finalize_operator_views(
+            {
+                **planning_state,
+                "diagnosis": diagnosis_name,
+                "confidence": confidence,
+                "confirmed": True,
+                "evidence_graph": evidence_graph,
+                "candidate_diagnoses": diagnosis_candidates,
+                "specialist_findings": specialist_findings,
+                "coordinator_summary": coordinator_summary,
+                "proposed_action": proposed_action,
+                "requires_human_approval": True,
+                "planned_commands": [planned_command],
+                "rollback_commands": [rollback],
+            }
+        )
 
         trace_add(
             state,
@@ -396,9 +602,17 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
             "confirmed": True,
             "evidence": evidence,
             "evidence_graph": evidence_graph,
+            "hypotheses": hypotheses,
+            "evidence_gate": evidence_gate,
+            "claim_validation": claim_validation,
+            "situation_summary": situation_summary,
             "specialist_findings": specialist_findings,
             "coordinator_summary": coordinator_summary,
             "investigation_activity": investigation_activity,
+            "incident_brief": action_views["incident_brief"],
+            "approval_summary": action_views["approval_summary"],
+            "handoff_summary": action_views["handoff_summary"],
+            "verification_summary": action_views["verification_summary"],
             "proposed_action": proposed_action,
             "requires_human_approval": True,
             "plan": [proposed_action],
@@ -424,8 +638,9 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
             "model_status": passive_model_status(),
         }
 
-    if decision.decision == "propose_action" and step_count <= int(state.get("max_steps", MAX_STEPS)):
+    if decision.decision == "propose_action" and tools_allowed and step_count <= int(state.get("max_steps", MAX_STEPS)):
         next_tool = str(coordinator_summary.get("recommended_next_tool") or "").strip() or "get_cluster_events"
+        next_tool = ensure_tool_prerequisites(next_tool, planning_state)
         tool_args = tool_args_for(next_tool, planning_state)
         tool_confirmation = _tool_confirmation_metadata(next_tool, state.get("integration_summary", []))
         investigation_activity = _build_investigation_activity(
@@ -457,9 +672,17 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
             "confidence": confidence,
             "confirmed": False,
             "evidence": evidence,
+            "hypotheses": hypotheses,
+            "evidence_gate": evidence_gate,
+            "claim_validation": claim_validation,
+            "situation_summary": situation_summary,
             "specialist_findings": specialist_findings,
             "coordinator_summary": coordinator_summary,
             "investigation_activity": investigation_activity,
+            "incident_brief": operator_views["incident_brief"],
+            "approval_summary": operator_views["approval_summary"],
+            "handoff_summary": operator_views["handoff_summary"],
+            "verification_summary": operator_views["verification_summary"],
             "thought_summary": thought,
             "planner_backend": planner_backend,
             "planner_error": planner_error,
@@ -476,8 +699,13 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
             **tool_confirmation,
         }
 
-    if decision.decision == "call_tool" and decision.tool_name and step_count <= int(state.get("max_steps", MAX_STEPS)):
-        next_tool = decision.tool_name
+    if (
+        decision.decision == "call_tool"
+        and tools_allowed
+        and decision.tool_name
+        and step_count <= int(state.get("max_steps", MAX_STEPS))
+    ):
+        next_tool = ensure_tool_prerequisites(decision.tool_name, planning_state)
         tool_args = tool_args_for(next_tool, planning_state)
         tool_confirmation = _tool_confirmation_metadata(next_tool, state.get("integration_summary", []))
         investigation_activity = _build_investigation_activity(
@@ -511,9 +739,17 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
             "confidence": confidence,
             "confirmed": False,
             "evidence": evidence,
+            "hypotheses": hypotheses,
+            "evidence_gate": evidence_gate,
+            "claim_validation": claim_validation,
+            "situation_summary": situation_summary,
             "specialist_findings": specialist_findings,
             "coordinator_summary": coordinator_summary,
             "investigation_activity": investigation_activity,
+            "incident_brief": operator_views["incident_brief"],
+            "approval_summary": operator_views["approval_summary"],
+            "handoff_summary": operator_views["handoff_summary"],
+            "verification_summary": operator_views["verification_summary"],
             "thought_summary": thought,
             "planner_backend": planner_backend,
             "planner_error": planner_error,
@@ -531,6 +767,83 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
         }
 
     escalation_reason = decision.escalation_reason or "Tool observations did not produce clear evidence."
+    if decision.decision == "escalate" and diagnosis_supported:
+        confirmed_views = _finalize_operator_views(
+            {
+                **planning_state,
+                "diagnosis": diagnosis_name,
+                "confidence": confidence,
+                "confirmed": True,
+                "evidence_graph": evidence_graph,
+                "candidate_diagnoses": diagnosis_candidates,
+                "specialist_findings": specialist_findings,
+                "coordinator_summary": coordinator_summary,
+                "requires_human_approval": False,
+                "planned_commands": [],
+                "rollback_commands": [],
+            }
+        )
+        trace_add(
+            state,
+            "agent_decision",
+            step_id=step_count,
+            hypothesis=diagnosis_name,
+            thought=thought,
+            confidence_before=state.get("confidence", 0.0),
+            confidence_after=confidence,
+            decision="diagnosed_escalation",
+            escalation_reason=escalation_reason,
+            planner_backend=planner_backend,
+            planner_error=planner_error,
+        )
+        investigation_activity = _build_investigation_activity(
+            retrieval_summary=f"Retrieved {len(planning_state.get('top_chunks', [])[:5])} grounded runbook chunks.",
+            coordinator_summary=coordinator_summary,
+            next_step="The diagnosis is supported, but no preconditioned catalog action is safe; hand off to the on-call SRE.",
+        )
+        return {
+            "step_count": step_count,
+            "predicted_type": next_predicted_type,
+            "diagnosis": diagnosis_name,
+            "confidence": confidence,
+            "confirmed": True,
+            "evidence": evidence,
+            "evidence_graph": evidence_graph,
+            "hypotheses": hypotheses,
+            "evidence_gate": evidence_gate,
+            "claim_validation": claim_validation,
+            "situation_summary": situation_summary,
+            "specialist_findings": specialist_findings,
+            "coordinator_summary": coordinator_summary,
+            "investigation_activity": investigation_activity,
+            "incident_brief": confirmed_views["incident_brief"],
+            "approval_summary": confirmed_views["approval_summary"],
+            "handoff_summary": confirmed_views["handoff_summary"],
+            "verification_summary": confirmed_views["verification_summary"],
+            "planned_commands": [],
+            "rollback_commands": [],
+            "requires_human_approval": False,
+            "policy_ok": True,
+            "plan": [],
+            "sanitized_plan": [],
+            "thought_summary": thought,
+            "escalation_reason": escalation_reason,
+            "planner_backend": planner_backend,
+            "planner_error": planner_error,
+            "retrieved": planning_state.get("retrieved", []),
+            "top_chunks": planning_state.get("top_chunks", []),
+            "retrieval_query": planning_state.get("retrieval_query", ""),
+            "retrieval_quality": planning_state.get("retrieval_quality", {}),
+            "retrieval_explanation": planning_state.get("retrieval_explanation", {}),
+            "retrieval_attempts": planning_state.get("retrieval_attempts", retrieval_attempts),
+            "candidate_diagnoses": diagnosis_candidates,
+            "latency_metrics": updated_latency,
+            "tool_confirmation_required": False,
+            "tool_confirmation_prompt": "",
+            "tool_confirmation_tool": "",
+            "model_status": passive_model_status(),
+        }
+
     append_message(state, "assistant", UNKNOWN_ESCALATION_OUTPUT)
     trace_add(
         state,
@@ -558,9 +871,17 @@ def node_agent(state: AgentState) -> Dict[str, Any]:
         "confirmed": False,
         "evidence": evidence,
         "evidence_graph": evidence_graph,
+        "hypotheses": hypotheses,
+        "evidence_gate": evidence_gate,
+        "claim_validation": claim_validation,
+        "situation_summary": situation_summary,
         "specialist_findings": specialist_findings,
         "coordinator_summary": coordinator_summary,
         "investigation_activity": investigation_activity,
+        "incident_brief": operator_views["incident_brief"],
+        "approval_summary": operator_views["approval_summary"],
+        "handoff_summary": operator_views["handoff_summary"],
+        "verification_summary": operator_views["verification_summary"],
         "final_response": UNKNOWN_ESCALATION_OUTPUT,
         "planned_commands": [],
         "rollback_commands": [],
@@ -594,10 +915,22 @@ def node_tools(state: AgentState) -> Dict[str, Any]:
     tool_started = time.perf_counter()
     with observe_duration(TOOL_DURATION, tool_name=tool_name):
         observation = client.call_tool(tool_name, **tool_args)
+    tool_duration_ms = (time.perf_counter() - tool_started) * 1000.0
 
     updated_results = dict(state.get("tool_results", {}))
     updated_results[tool_name] = observation
     observation_summary = summarize_observation(tool_name, observation)
+    updated_ledger = list(state.get("evidence_ledger") or [])
+    updated_ledger.append(
+        tool_evidence(
+            ledger=updated_ledger,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            observation=observation,
+            incident_context=state.get("incident_context"),
+            duration_ms=tool_duration_ms,
+        )
+    )
 
     append_message(state, "tool", f"{tool_name}: {observation_summary}")
     trace_add(
@@ -609,14 +942,39 @@ def node_tools(state: AgentState) -> Dict[str, Any]:
     )
 
     updated_evidence = evidence_from_tools({**state, "tool_results": updated_results})
-    specialist_findings = build_specialist_findings(updated_evidence, (state.get("service_memory") or {}).get("payload", {}))
-    coordinator_summary = coordinate_specialist_findings(specialist_findings, state.get("candidate_diagnoses", []))
+    analysis = _refresh_analysis(
+        {**state, "tool_results": updated_results, "evidence_ledger": updated_ledger},
+        evidence=updated_evidence,
+    )
+    specialist_findings = analysis["specialist_findings"]
+    coordinator_summary = analysis["coordinator_summary"]
+    evidence_graph = analysis["evidence_graph"]
+    diagnosis_candidates = analysis["candidate_diagnoses"]
+    operator_views = _finalize_operator_views(
+        {
+            **state,
+            "tool_results": updated_results,
+            "evidence": updated_evidence,
+            "evidence_graph": evidence_graph,
+            "specialist_findings": specialist_findings,
+            "coordinator_summary": coordinator_summary,
+            "candidate_diagnoses": diagnosis_candidates,
+        }
+    )
     return {
         "tool_results": updated_results,
         "evidence": updated_evidence,
-        "evidence_graph": build_evidence_graph({**state, "tool_results": updated_results, "evidence": updated_evidence}),
+        "evidence_ledger": updated_ledger,
+        "hypotheses": hypothesis_snapshot(diagnosis_candidates, evidence_graph),
+        "evidence_gate": evaluate_evidence_gate(diagnosis_candidates, evidence_graph),
+        "evidence_graph": evidence_graph,
         "specialist_findings": specialist_findings,
         "coordinator_summary": coordinator_summary,
+        "candidate_diagnoses": diagnosis_candidates,
+        "incident_brief": operator_views["incident_brief"],
+        "approval_summary": operator_views["approval_summary"],
+        "handoff_summary": operator_views["handoff_summary"],
+        "verification_summary": operator_views["verification_summary"],
         "investigation_activity": _build_investigation_activity(
             retrieval_summary=f"Retrieved {len(state.get('top_chunks', [])[:5])} grounded runbook chunks.",
             coordinator_summary=coordinator_summary,
@@ -638,10 +996,14 @@ def node_tools(state: AgentState) -> Dict[str, Any]:
 
 
 def node_hitl_interrupt(state: AgentState) -> Dict[str, Any]:
+    approval = dict(state.get("approval_summary") or build_approval_summary(state))
     command = state.get("planned_commands", ["(none)"])[0]
-    prompt = f"Proposed command: {command}. Approve? Y/N"
+    prompt = (
+        f"{approval.get('summary', 'Review the proposed action.')}"
+        f" Command: {command}. Risk: {approval.get('risk_level', 'unknown')}."
+    )
     trace_add(state, "hitl_interrupt", prompt=prompt, action=state.get("proposed_action", {}))
-    return {"approval_prompt": prompt}
+    return {"approval_prompt": prompt, "approval_summary": approval}
 
 
 def node_execute(state: AgentState) -> Dict[str, Any]:
@@ -653,7 +1015,7 @@ def node_execute(state: AgentState) -> Dict[str, Any]:
     if mode == "preview":
         result = {"status": "preview", "tool": "execute_remediation", "command": planned_command, "action": action}
         trace_add(state, "execute", mode=mode, result=result)
-        return {
+        output = {
             "execution_results": [result],
             "rollback_record": {
                 "status": "ready" if state.get("rollback_commands") else "not_available",
@@ -665,6 +1027,8 @@ def node_execute(state: AgentState) -> Dict[str, Any]:
             "improved": False,
             "improvement_summary": "Preview only. No changes were applied.",
         }
+        output["verification_summary"] = build_verification_summary({**state, **output})
+        return output
 
     execution_id = f"{state.get('run_id') or 'local'}_{uuid4().hex[:8]}"
     response = ExecutorClient().execute(
@@ -693,7 +1057,7 @@ def node_execute(state: AgentState) -> Dict[str, Any]:
         executor_transport=response.get("executor_transport", "embedded"),
     )
 
-    return {
+    output = {
         "execution_results": response.get("execution_results", []),
         "rollback_record": response.get("rollback_record", {}),
         "executor_transport": response.get("executor_transport", "embedded"),
@@ -702,6 +1066,8 @@ def node_execute(state: AgentState) -> Dict[str, Any]:
         "improved": bool(response.get("improved", False)),
         "improvement_summary": response.get("improvement_summary", ""),
     }
+    output["verification_summary"] = build_verification_summary({**state, **output})
+    return output
 
 
 def route_after_agent(state: AgentState) -> str:
@@ -758,19 +1124,33 @@ def run_incident_langgraph(
     tool_mode: str = "mcp",
     run_id: str = "",
     incident_payload: Dict[str, Any] | None = None,
+    incident_context: Dict[str, Any] | None = None,
+    evaluation_profile: str = "hybrid_full",
     save_artifacts_enabled: bool = True,
 ) -> Dict[str, Any]:
-    if incident_payload is not None:
+    resolved_payload = incident_payload
+    if incident_context:
+        fixture = incident_payload
+        if fixture is None:
+            try:
+                fixture = load_incident(incident_id)
+            except FileNotFoundError:
+                fixture = None
+        resolved_payload = incident_payload_from_context(incident_context, fixture=fixture)
+        MockMCP.seed_live_state(incident_id, resolved_payload)
+    elif incident_payload is not None:
         MockMCP.seed_live_state(incident_id, incident_payload)
 
     final_state = GRAPH.invoke(
         {
             "run_id": run_id,
             "incident_id": incident_id,
-            "incident": incident_payload or {},
+            "incident": resolved_payload or {},
+            "incident_context": incident_context or {},
             "approved": approved,
             "execution_mode": normalize_execution_mode(execution_mode),
             "tool_mode": normalize_tool_mode(tool_mode),
+            "evaluation_profile": evaluation_profile,
         }
     )
 
@@ -778,13 +1158,18 @@ def run_incident_langgraph(
     final_state["saved_trace"] = persist_trace(final_state)
     final_state["rca_draft"] = final_state["final_response"]
     final_state["rca_final"] = final_state["final_response"]
+    final_state.update(_finalize_operator_views(final_state))
+    final_state.update(build_grounded_report(final_state))
 
     result = {
         "run_id": run_id,
         "incident_id": incident_id,
+        "incident": final_state.get("incident", {}),
+        "incident_context": final_state.get("incident_context", incident_context or {}),
         "system_prompt": SYSTEM_PROMPT,
         "execution_mode": normalize_execution_mode(execution_mode),
         "tool_mode": normalize_tool_mode(tool_mode),
+        "evaluation_profile": evaluation_profile,
         "predicted_type": final_state.get("predicted_type", "Unknown"),
         "planner_backend": final_state.get("planner_backend", ""),
         "planner_error": final_state.get("planner_error", ""),
@@ -803,6 +1188,13 @@ def run_incident_langgraph(
         "messages": final_state.get("messages", []),
         "trace": final_state.get("trace", []),
         "evidence": final_state.get("evidence", {}),
+        "evidence_ledger": final_state.get("evidence_ledger", []),
+        "hypotheses": final_state.get("hypotheses") or hypothesis_snapshot(final_state.get("candidate_diagnoses", []), final_state.get("evidence_graph", [])),
+        "situation_summary": final_state.get("situation_summary", ""),
+        "evidence_gate": evaluate_evidence_gate(final_state.get("candidate_diagnoses", []), final_state.get("evidence_graph", [])),
+        "incident_report": final_state.get("incident_report", {}),
+        "claim_validation": final_state.get("claim_validation", {}),
+        "remediation_options": final_state.get("remediation_options", []),
         "evidence_graph": final_state.get("evidence_graph", []),
         "specialist_findings": final_state.get("specialist_findings", []),
         "coordinator_summary": final_state.get("coordinator_summary", {}),
@@ -814,6 +1206,10 @@ def run_incident_langgraph(
         "runtime_health": final_state.get("runtime_health", {}),
         "thought_summary": final_state.get("thought_summary", ""),
         "escalation_reason": final_state.get("escalation_reason", ""),
+        "incident_brief": final_state.get("incident_brief", {}),
+        "approval_summary": final_state.get("approval_summary", {}),
+        "handoff_summary": final_state.get("handoff_summary", {}),
+        "verification_summary": final_state.get("verification_summary", {}),
         "plan": final_state.get("plan", []),
         "proposed_action": final_state.get("proposed_action", {}),
         "requires_human_approval": bool(final_state.get("requires_human_approval", False)),
@@ -837,6 +1233,11 @@ def run_incident_langgraph(
         "latency_metrics": final_state.get("latency_metrics", {}),
         "catalog_version": catalog_version(),
     }
+    decisions = [event for event in result.get("trace", []) if event.get("type") == "agent_decision"]
+    errors = list(dict.fromkeys(str(event["planner_error"]) for event in decisions if event.get("planner_error")))
+    if errors:
+        result["planner_error"] = "; ".join(errors)
+    result["planner_fallback_count"] = sum(bool(event.get("planner_error")) or "fallback" in str(event.get("planner_backend", "")) for event in decisions)
     verification = dict(result.get("verification") or {})
     if verification:
         result["verification_outcome"] = str(

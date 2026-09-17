@@ -1,26 +1,25 @@
 from __future__ import annotations
 
+import json
 import math
-import os
 import re
 from collections import Counter, defaultdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from agent.incident_catalog import all_incident_definitions, catalog_keywords
+from agent.model_runtime import passive_model_status
 from agent.service_memory import load_service_memory
+from runtime.resilience import run_with_retry
+from runtime.settings import get_settings
 
 RUNBOOKS_DIR = Path("runbooks")
-COLLECTION_NAME = "sre_runbooks"
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-SEMANTIC_RETRIEVAL_ENABLED = os.getenv("SRE_ENABLE_SEMANTIC_RETRIEVAL", "").strip().lower() in {"1", "true", "yes"}
-CROSS_ENCODER_RERANK_ENABLED = os.getenv("SRE_ENABLE_CROSS_ENCODER_RERANK", "").strip().lower() in {"1", "true", "yes"}
-RERANK_MODEL_NAME = os.getenv("SRE_RERANK_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2").strip()
 METADATA_RE = re.compile(r"^-\s*([^:]+):\s*(.+?)\s*$")
 
 
@@ -90,10 +89,13 @@ def _parse_runbook_metadata(text: str) -> Dict[str, Any]:
 @lru_cache(maxsize=1)
 def _runbook_chunks() -> List[Dict[str, Any]]:
     chunks: List[Dict[str, Any]] = []
+    active_incident_types = {definition.incident_type for definition in all_incident_definitions()}
     for path in sorted(RUNBOOKS_DIR.glob("*.md")):
         text = path.read_text(encoding="utf-8")
         metadata = _parse_runbook_metadata(text)
         incident_type = str(metadata.get("incident_type") or _infer_incident_type_from_filename(path.name))
+        if active_incident_types and incident_type not in active_incident_types:
+            continue
         current_section = "Overview"
         current_lines: List[str] = []
         for line in text.splitlines():
@@ -154,32 +156,6 @@ def _vector_scores(query: str) -> List[float]:
     return [float(value) for value in sims]
 
 
-def _qdrant_scores(query: str, limit: int) -> Dict[Tuple[str, str], float]:
-    if not SEMANTIC_RETRIEVAL_ENABLED or not query.strip():
-        return {}
-    try:
-        from qdrant_client import QdrantClient
-        from sentence_transformers import SentenceTransformer
-
-        client = QdrantClient(url=QDRANT_URL)
-        model = SentenceTransformer(EMBED_MODEL_NAME, local_files_only=True)
-        qvec = model.encode(query).tolist()
-        results = client.search(
-            collection_name=COLLECTION_NAME,
-            query_vector=qvec,
-            limit=limit,
-            with_payload=True,
-        )
-        scores: Dict[Tuple[str, str], float] = {}
-        for result in results:
-            payload = result.payload or {}
-            key = (str(payload.get("source_file", "")), str(payload.get("section", "")))
-            scores[key] = float(result.score)
-        return scores
-    except Exception:
-        return {}
-
-
 def _candidate_prior(incident_type: str, incident: Dict[str, Any] | None) -> float:
     if incident is None:
         return 0.0
@@ -231,6 +207,21 @@ def _metadata_score(chunk: Dict[str, Any], incident: Dict[str, Any] | None, quer
     return score
 
 
+def _passes_metadata_prefilter(chunk: Dict[str, Any], incident: Dict[str, Any] | None) -> bool:
+    incident_meta = _incident_context(incident)
+    if not any(incident_meta.values()):
+        return True
+    metadata = dict(chunk.get("metadata", {}) or {})
+    services = [str(item).lower() for item in metadata.get("services", [])] if isinstance(metadata.get("services"), list) else []
+    severity = str(metadata.get("severity", "")).strip().lower()
+
+    if incident_meta["service"] and services and "any" not in services and incident_meta["service"] not in services and incident_meta["component"] not in services:
+        return False
+    if incident_meta["severity"] and severity and incident_meta["severity"] != severity:
+        return False
+    return True
+
+
 def _service_memory_prior(incident_type: str, incident: Dict[str, Any] | None) -> float:
     incident_meta = _incident_context(incident)
     service = incident_meta["service"]
@@ -239,9 +230,13 @@ def _service_memory_prior(incident_type: str, incident: Dict[str, Any] | None) -
     memory = load_service_memory(service, namespace=incident_meta["namespace"] or "prod")
     payload = dict(memory.get("payload") or {})
     historical = [str(item.get("type", "")).strip() for item in payload.get("incident_history", []) if isinstance(item, dict)]
-    if incident_type in historical:
-        return 0.15
-    return 0.0
+    feedback_matches = sum(
+        1
+        for item in payload.get("validated_feedback_priors", [])
+        if isinstance(item, dict) and str(item.get("incident_type", "")).strip() == incident_type
+    )
+    # Human feedback is a weak prior only; live evidence and retrieval scores must dominate it.
+    return (0.15 if incident_type in historical else 0.0) + min(feedback_matches * 0.04, 0.12)
 
 
 def _hint_text(query: str, incident: Dict[str, Any] | None, evidence: Dict[str, Any] | None) -> str:
@@ -323,33 +318,6 @@ def _diverse_select(chunks: List[Dict[str, Any]], limit: int) -> List[Dict[str, 
         type_counts[str(chosen.get("incident_type", "Unknown"))] += 1
         section_counts[str(chosen.get("section", ""))] += 1
     return selected
-
-
-@lru_cache(maxsize=1)
-def _cross_encoder():
-    if not CROSS_ENCODER_RERANK_ENABLED:
-        return None
-    try:
-        from sentence_transformers import CrossEncoder
-
-        return CrossEncoder(RERANK_MODEL_NAME, local_files_only=True)
-    except Exception:
-        return None
-
-
-def _cross_encoder_scores(query: str, chunks: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
-    model = _cross_encoder()
-    if model is None or not chunks or not query.strip():
-        return {}
-    try:
-        pairs = [(query, f"{chunk.get('section', '')}\n{chunk.get('text', '')}") for chunk in chunks]
-        scores = model.predict(pairs)
-        return {
-            (str(chunk.get("source_file", "")), str(chunk.get("section", ""))): float(score)
-            for chunk, score in zip(chunks, scores)
-        }
-    except Exception:
-        return {}
 
 
 def _rerank_chunk(chunk: Dict[str, Any], incident: Dict[str, Any] | None, evidence: Dict[str, Any] | None) -> float:
@@ -435,6 +403,9 @@ def _retrieval_explanation(
     selected: List[Dict[str, Any]],
     quality: Dict[str, Any],
     incident: Dict[str, Any] | None,
+    *,
+    prefilter_used: bool = False,
+    prefilter_matches: int = 0,
 ) -> Dict[str, Any]:
     incident_meta = _incident_context(incident)
     service_memory = load_service_memory(incident_meta["service"], namespace=incident_meta["namespace"] or "prod") if incident_meta["service"] else {}
@@ -457,7 +428,11 @@ def _retrieval_explanation(
             }
             for chunk in selected[:5]
         ],
-        "selection_strategy": "hybrid + rerank + diversity",
+        "selection_strategy": "lexical + tfidf + evidence context + diversity",
+        "metadata_prefilter": {
+            "used": prefilter_used,
+            "match_count": prefilter_matches,
+        },
         "quality": quality,
     }
 
@@ -501,7 +476,6 @@ def retrieve_runbook_context(
     terms = lexical_terms(query)
     query_text = query.lower()
     vector_scores = _vector_scores(query)
-    qdrant_scores = _qdrant_scores(query, limit=max(limit * 2, 12))
     hint_scores = _incident_hint_scores(query, incident, evidence)
     chunks: List[Dict[str, Any]] = []
 
@@ -511,13 +485,12 @@ def retrieve_runbook_context(
         keywords = catalog_keywords(incident_type)
         lexical_score = _lexical_score(chunk["text"], terms, keywords, query_text)
         vector_score = vector_scores[idx] if idx < len(vector_scores) else 0.0
-        qdrant_score = qdrant_scores.get((str(chunk.get("source_file", "")), str(chunk.get("section", ""))), 0.0)
         prior_score = _candidate_prior(incident_type, incident)
         service_memory_score = _service_memory_prior(incident_type, incident)
         metadata_score = _metadata_score(chunk, incident, terms)
         rerank_score = _rerank_chunk(chunk, incident, evidence)
         hint_score = hint_scores.get(incident_type, 0.0)
-        combined = lexical_score + (vector_score * 6.0) + (qdrant_score * 1.5) + prior_score + service_memory_score + rerank_score + hint_score
+        combined = lexical_score + (vector_score * 6.0) + prior_score + service_memory_score + rerank_score + hint_score
         if combined <= 0:
             continue
         chunk.update(
@@ -526,7 +499,6 @@ def retrieve_runbook_context(
                 "score_breakdown": {
                     "lexical": round(lexical_score, 3),
                     "vector": round(vector_score, 3),
-                    "semantic": round(qdrant_score, 3),
                     "prior": round(prior_score, 3),
                     "service_memory": round(service_memory_score, 3),
                     "metadata": round(metadata_score, 3),
@@ -539,17 +511,20 @@ def retrieve_runbook_context(
         chunks.append(chunk)
 
     chunks.sort(key=lambda item: (float(item.get("score", 0.0)), item.get("source_file", "")), reverse=True)
-    preselected = chunks[: max(limit * 4, 16)]
-    cross_scores = _cross_encoder_scores(query, preselected)
-    for chunk in preselected:
-        cross_score = cross_scores.get((str(chunk.get("source_file", "")), str(chunk.get("section", ""))), 0.0)
-        chunk["score"] = round(float(chunk.get("score", 0.0)) + (cross_score * 1.75), 3)
-        chunk.setdefault("score_breakdown", {})["cross_encoder"] = round(cross_score, 3)
+    prefiltered = [chunk for chunk in chunks if _passes_metadata_prefilter(chunk, incident)]
+    preselected = (prefiltered or chunks)[: max(limit * 4, 16)]
     preselected.sort(key=lambda item: (float(item.get("score", 0.0)), item.get("source_file", "")), reverse=True)
     selected = _diverse_select(preselected, limit)
     quality = _quality_score(selected, terms)
     candidates = _candidate_rankings(selected)
-    explanation = _retrieval_explanation(query, selected, quality, incident)
+    explanation = _retrieval_explanation(
+        query,
+        selected,
+        quality,
+        incident,
+        prefilter_used=bool(prefiltered),
+        prefilter_matches=len(prefiltered),
+    )
     predicted_type = candidates[0]["incident_type"] if candidates else "Unknown"
     if len(candidates) > 1 and math.isclose(
         float(candidates[0].get("retrieval_score", 0.0)),
@@ -586,10 +561,15 @@ def retrieve_runbook_chunks(
     return retrieve_runbook_context(query, incident=incident, evidence=evidence, limit=limit)["retrieved"]
 
 
-def summarize_retrieval_context(query: str, retrieved: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize_retrieval_context(
+    query: str,
+    retrieved: List[Dict[str, Any]],
+    *,
+    incident: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     quality = _quality_score(retrieved, lexical_terms(query))
     candidates = _candidate_rankings(retrieved)
-    explanation = _retrieval_explanation(query, retrieved, quality, None)
+    explanation = _retrieval_explanation(query, retrieved, quality, incident)
     predicted_type = candidates[0]["incident_type"] if candidates else "Unknown"
     if len(candidates) > 1 and abs(float(candidates[0].get("retrieval_score", 0.0)) - float(candidates[1].get("retrieval_score", 0.0))) <= 0.25:
         predicted_type = "Unknown"
@@ -610,6 +590,133 @@ def summarize_retrieval_context(query: str, retrieved: List[Dict[str, Any]]) -> 
     }
 
 
+def _retry_query_prompt(incident: Dict[str, Any], evidence: Dict[str, Any], candidate_diagnoses: List[Dict[str, Any]]) -> str:
+    top_candidates = [
+        {
+            "incident_type": item.get("incident_type", "Unknown"),
+            "score": item.get("score", item.get("retrieval_confidence", 0.0)),
+        }
+        for item in candidate_diagnoses[:3]
+    ]
+    payload = {
+        "incident": {
+            "incident_id": incident.get("incident_id"),
+            "service": incident.get("service"),
+            "namespace": incident.get("namespace"),
+            "description": incident.get("description"),
+        },
+        "evidence": {
+            "metrics": evidence.get("metrics", {}),
+            "logs_tail": list(evidence.get("logs_tail") or [])[-4:],
+            "cluster_events": list(evidence.get("cluster_events") or [])[-3:],
+        },
+        "top_candidates": top_candidates,
+    }
+    return (
+        "Rewrite the incident search query for retrieval. "
+        "Return only a JSON object like {\"query\": \"...\"}. "
+        "Keep it short, concrete, and focused on the most discriminating symptoms.\n"
+        f"{json.dumps(payload, indent=2)}"
+    )
+
+
+def _rewrite_query_with_ollama(prompt: str) -> str:
+    settings = get_settings()
+    req = Request(
+        url=f"{settings.planner_base_url.rstrip('/')}/api/chat",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(
+            {
+                "model": settings.planner_model,
+                "stream": False,
+                "think": False,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You rewrite retrieval queries for an SRE incident assistant. Output JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "format": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+                "options": {"temperature": 0.1, "num_ctx": settings.planner_context_tokens, "num_predict": 128},
+            }
+        ).encode("utf-8"),
+        method="POST",
+    )
+    with urlopen(req, timeout=min(get_settings().planner_timeout_seconds, 8.0)) as resp:
+        raw = json.loads(resp.read().decode("utf-8"))
+    content = str(((raw.get("message") or {}).get("content") or "")).strip()
+    return str(json.loads(content).get("query", "")).strip()
+
+
+def _rewrite_query_with_openai(prompt: str) -> str:
+    settings = get_settings()
+    headers = {"Content-Type": "application/json"}
+    if settings.planner_api_key:
+        headers["Authorization"] = f"Bearer {settings.planner_api_key}"
+    req = Request(
+        url=f"{settings.planner_base_url.rstrip('/')}/v1/chat/completions",
+        headers=headers,
+        data=json.dumps(
+            {
+                "model": settings.planner_model,
+                "temperature": 0.1,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "retrieval_query",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                        },
+                    },
+                },
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You rewrite retrieval queries for an SRE incident assistant. Output JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            }
+        ).encode("utf-8"),
+        method="POST",
+    )
+    with urlopen(req, timeout=min(get_settings().planner_timeout_seconds, 8.0)) as resp:
+        raw = json.loads(resp.read().decode("utf-8"))
+    choices = list(raw.get("choices") or [])
+    if not choices:
+        return ""
+    content = str(((choices[0] or {}).get("message") or {}).get("content") or "").strip()
+    return str(json.loads(content).get("query", "")).strip()
+
+
+def _maybe_ai_retry_query(incident: Dict[str, Any], evidence: Dict[str, Any], candidate_diagnoses: List[Dict[str, Any]]) -> str:
+    settings = get_settings()
+    if settings.planner_provider == "deterministic":
+        return ""
+    if passive_model_status().get("cooldown_active"):
+        return ""
+    prompt = _retry_query_prompt(incident, evidence, candidate_diagnoses)
+    try:
+        caller = _rewrite_query_with_openai if settings.planner_provider in {"openai", "openai_compatible"} else _rewrite_query_with_ollama
+        query = run_with_retry(
+            lambda: caller(prompt),
+            retries=0,
+            timeout_seconds=min(settings.planner_timeout_seconds, 8.0),
+            operation_name="retrieval:query_rewrite",
+            retry_exceptions=(URLError, TimeoutError, ValueError, json.JSONDecodeError),
+        )
+        return str(query or "").strip()
+    except Exception:
+        return ""
+
+
 def build_retry_query(incident: Dict[str, Any], evidence: Dict[str, Any], candidate_diagnoses: List[Dict[str, Any]]) -> str:
     pieces = [str(incident.get("description", ""))]
     top_candidate = candidate_diagnoses[0]["incident_type"] if candidate_diagnoses else "Unknown"
@@ -625,4 +732,6 @@ def build_retry_query(incident: Dict[str, Any], evidence: Dict[str, Any], candid
     events = evidence.get("cluster_events", []) or []
     if events:
         pieces.append(" ".join(str(line) for line in events[-2:]))
-    return " ".join(part for part in pieces if str(part).strip())
+    deterministic_query = " ".join(part for part in pieces if str(part).strip())
+    ai_query = _maybe_ai_retry_query(incident, evidence, candidate_diagnoses)
+    return ai_query or deterministic_query

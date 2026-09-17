@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 
+from agent.evidence_graph import build_evidence_graph
 from agent.retrieval import retrieve_runbook_context
 from evaluation.live_backends import run_live_backend_probe
-from ops.job_queue import RedisDurableJobQueue, reset_job_queue
+from runtime.job_queue import RedisDurableJobQueue, reset_job_queue
 
 
-def test_retrieval_prefers_tls_runbook_for_ingress_context() -> None:
+def test_retrieval_ignores_inactive_tls_runbook_for_small_path() -> None:
     incident = {
         "service": "ingress",
         "severity": "sev1",
@@ -17,10 +18,9 @@ def test_retrieval_prefers_tls_runbook_for_ingress_context() -> None:
 
     result = retrieve_runbook_context(incident["description"], incident=incident, evidence={}, limit=5)
 
-    assert result["predicted_type"] == "TLSCertificateExpiry"
-    assert result["retrieved"][0]["source_file"] == "07_tls_certificate_expiry.md"
-    assert result["retrieval_quality"]["metadata_alignment"] > 0
-    assert result["retrieval_quality"]["source_diversity"] > 0
+    assert result["predicted_type"] == "Unknown"
+    assert all(item["incident_type"] != "TLSCertificateExpiry" for item in result["retrieved"])
+    assert result["retrieval_quality"]["needs_retry"] is True
 
 
 def test_retrieval_prefers_dns_context_for_dns_alert() -> None:
@@ -35,7 +35,7 @@ def test_retrieval_prefers_dns_context_for_dns_alert() -> None:
 
     assert result["predicted_type"] == "DNSFailure"
     assert any(item["incident_type"] == "DNSFailure" for item in result["retrieved"][:2])
-    assert result["retrieval_explanation"]["selection_strategy"] == "hybrid + rerank + diversity"
+    assert result["retrieval_explanation"]["selection_strategy"] == "lexical + tfidf + evidence context + diversity"
 
 
 class _FakeRedis:
@@ -71,8 +71,8 @@ def test_redis_durable_queue_submits_and_drains(monkeypatch) -> None:
     fake_redis = _FakeRedis()
     seen: list[dict[str, object]] = []
 
-    monkeypatch.setattr("ops.job_queue.redis.from_url", lambda *args, **kwargs: fake_redis)
-    monkeypatch.setattr("ops.job_queue.dispatch_job", lambda job: seen.append(job))
+    monkeypatch.setattr("runtime.job_queue.redis.from_url", lambda *args, **kwargs: fake_redis)
+    monkeypatch.setattr("runtime.job_queue.dispatch_job", lambda job: seen.append(job))
     reset_job_queue()
 
     queue = RedisDurableJobQueue(
@@ -132,3 +132,21 @@ def test_live_backend_probe_reports_tool_health(monkeypatch) -> None:
     assert probe["healthy_tools"] == probe["total_tools"]
     assert probe["tools"]["get_metrics"]["ok"] is True
     assert probe["tools"]["query_loki"]["payload"]["lines"] == ["INFO healthy"]
+
+
+def test_evidence_graph_marks_freshness_and_source_reliability() -> None:
+    graph = build_evidence_graph(
+        {
+            "incident": {"description": "API is failing"},
+            "service_memory": {"service": "api", "summary": "Historical summary"},
+            "top_chunks": [{"source_file": "04_service_503_upstream_down.md", "section": "Symptoms", "text": "503s", "incident_type": "Service503"}],
+            "tool_results": {"get_metrics": {"error_rate_percent": 8.0}},
+            "specialist_findings": [{"specialist": "metrics", "summary": "Error rate is elevated."}],
+        }
+    )
+
+    by_type = {item["source_type"]: item for item in graph}
+    assert by_type["alert"]["freshness"] == "current"
+    assert by_type["tool"]["source_reliability"] >= 0.9
+    assert by_type["runbook"]["freshness"] == "reference"
+    assert by_type["service_memory"]["freshness"] == "historical"

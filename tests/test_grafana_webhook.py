@@ -7,10 +7,11 @@ from typing import Any, Dict, List
 from fastapi.testclient import TestClient
 
 import agent.langgraph_agent as lg
-import ops.api as api_module
-from mcp_tools.mock_mcp import MockMCP
-from ops.db import init_db, reset_db_state
-from ops.settings import reset_settings_cache
+import runtime.api as api_module
+from integrations.mock_mcp import MockMCP
+from runtime.db import init_db, reset_db_state
+from runtime.settings import reset_settings_cache
+from runtime.storage import list_audit_events, mark_run_status
 
 
 def _fake_retrieval(query: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -54,6 +55,7 @@ def _configure_test_environment(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.delenv("OPS_API_TOKEN", raising=False)
     monkeypatch.setenv("OPS_API_TOKENS", "viewer-token|viewer|Viewer,operator-token|operator|Operator")
     monkeypatch.setenv("GRAFANA_WEBHOOK_TOKEN", "grafana-test-token")
+    monkeypatch.setenv("SRE_WEBHOOK_WAIT_FOR_PLAN", "1")
     monkeypatch.setenv("SRE_AGENT_PLANNER_PROVIDER", "deterministic")
     reset_settings_cache()
     reset_db_state()
@@ -106,7 +108,44 @@ def test_grafana_webhook_creates_plan_run(monkeypatch, tmp_path: Path) -> None:
     assert payload["created"] is True
     assert payload["incident_id"] == "INC-002"
     assert payload["run"]["request"]["source"] == "grafana_webhook"
+    context = payload["run"]["request"]["incident_context"]
+    assert context["source"] == "grafana"
+    assert context["service"] == "demo-api"
+    assert context["summary"] == "Demo API is serving too many 5xx responses."
+    assert context["raw_alert"]["alerts"][0]["labels"]["incident_id"] == "INC-002"
+    assert payload["run"]["plan_result"]["incident_context"] == context
     assert payload["run"]["plan_result"]["diagnosis"] == "Service503"
+    ledger = payload["run"]["plan_result"]["evidence_ledger"]
+    assert ledger[0]["kind"] == "alert"
+    assert sum(1 for item in ledger if item["kind"] == "tool_observation") >= 2
+    assert payload["run"]["plan_result"]["evidence_gate"]["passed"] is True
+
+
+def test_grafana_webhook_acknowledges_before_investigation(monkeypatch, tmp_path: Path) -> None:
+    _configure_test_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("SRE_WEBHOOK_WAIT_FOR_PLAN", "0")
+    reset_settings_cache()
+
+    api = importlib.reload(api_module)
+
+    class _Queue:
+        def submit(self, job_type: str, run_id: str, group_key: str, payload: dict[str, Any]) -> bool:
+            assert job_type == "plan"
+            assert run_id
+            assert group_key
+            assert payload["incident_id"] == "INC-002"
+            return True
+
+    monkeypatch.setattr(api, "get_job_queue", lambda: _Queue())
+    client = TestClient(api.app)
+    response = client.post("/alerts/grafana/webhook?token=grafana-test-token", json=_firing_payload())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is True
+    assert payload["created"] is True
+    assert payload["run"]["status"] == "queued"
+    assert payload["run"]["plan_result"] is None
 
 
 def test_generic_alert_endpoint_creates_plan_run(monkeypatch, tmp_path: Path) -> None:
@@ -136,6 +175,61 @@ def test_generic_alert_endpoint_creates_plan_run(monkeypatch, tmp_path: Path) ->
     assert payload["created"] is True
     assert payload["normalized"]["source_type"] == "generic"
     assert payload["run"]["request"]["source"] == "generic_alert"
+
+
+def test_generic_external_incident_without_fixture_is_investigated_safely(monkeypatch, tmp_path: Path) -> None:
+    _configure_test_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("ALERT_WEBHOOK_TOKEN", "generic-test-token")
+    reset_settings_cache()
+    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_retrieval)
+
+    api = importlib.reload(api_module)
+    client = TestClient(api.app)
+    raw_alert = {
+        "incident_id": "EXT-4711",
+        "alertname": "Checkout saturation",
+        "summary": "Checkout latency increased after a release.",
+        "status": "firing",
+        "service": "checkout",
+        "namespace": "shop-prod",
+        "severity": "critical",
+        "environment": "production",
+    }
+
+    response = client.post("/alerts/events?token=generic-test-token", json=raw_alert)
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["incident_id"] == "EXT-4711"
+    context = payload["run"]["request"]["incident_context"]
+    assert context["service"] == "checkout"
+    assert context["namespace"] == "shop-prod"
+    assert context["raw_alert"] == raw_alert
+    assert payload["run"]["plan_result"]["incident_context"] == context
+
+
+def test_alert_without_source_incident_id_gets_stable_generated_id(monkeypatch, tmp_path: Path) -> None:
+    _configure_test_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("ALERT_WEBHOOK_TOKEN", "generic-test-token")
+    reset_settings_cache()
+    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_retrieval)
+
+    api = importlib.reload(api_module)
+    client = TestClient(api.app)
+    raw_alert = {
+        "alertname": "Unfamiliar checkout signal",
+        "summary": "A previously unseen checkout condition fired.",
+        "status": "firing",
+        "service": "checkout",
+        "starts_at": "2026-08-22T18:00:00Z",
+    }
+
+    first = client.post("/alerts/events?token=generic-test-token", json=raw_alert)
+    second = client.post("/alerts/events?token=generic-test-token", json=raw_alert)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["incident_id"].startswith("ALERT-")
+    assert first.json()["incident_id"] == second.json()["incident_id"]
 
 
 def test_grafana_webhook_maps_crashloop_alert(monkeypatch, tmp_path: Path) -> None:
@@ -211,6 +305,23 @@ def test_grafana_webhook_ignores_resolved_alert(monkeypatch, tmp_path: Path) -> 
     assert body["reason"] == "resolved_alert"
 
 
+def test_grafana_webhook_does_not_investigate_datasource_meta_alert(monkeypatch, tmp_path: Path) -> None:
+    _configure_test_environment(monkeypatch, tmp_path)
+
+    api = importlib.reload(api_module)
+    client = TestClient(api.app)
+    payload = _firing_payload(alertname="DatasourceError")
+    payload["alerts"][0]["annotations"]["Error"] = "Prometheus query endpoint unavailable"
+
+    response = client.post("/alerts/grafana/webhook?token=grafana-test-token", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["created"] is False
+    assert body["reason"] == "observability_meta_alert"
+
+
 def test_grafana_webhook_deduplicates_active_alert(monkeypatch, tmp_path: Path) -> None:
     _configure_test_environment(monkeypatch, tmp_path)
     monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_retrieval)
@@ -262,6 +373,36 @@ def test_grafana_webhook_creates_new_run_for_new_alert_occurrence(monkeypatch, t
     second_body = second.json()
     assert second_body["created"] is True
     assert second_body["run_id"] != first_run
+
+
+def test_resolved_webhook_is_audited_after_execution_already_finished(monkeypatch, tmp_path: Path) -> None:
+    _configure_test_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_retrieval)
+
+    api = importlib.reload(api_module)
+    client = TestClient(api.app)
+    starts_at = "2026-03-11T21:30:00Z"
+    firing = client.post(
+        "/alerts/grafana/webhook?token=grafana-test-token",
+        json=_firing_payload(starts_at=starts_at),
+    )
+    run_id = firing.json()["run_id"]
+    mark_run_status(run_id, "resolved")
+
+    resolved = _firing_payload(starts_at=starts_at)
+    resolved["status"] = "resolved"
+    resolved["alerts"][0]["status"] = "resolved"
+    response = client.post("/alerts/grafana/webhook?token=grafana-test-token", json=resolved)
+
+    assert response.status_code == 200
+    assert response.json()["resolved_runs"] == 1
+    events = [event for event in list_audit_events(run_id) if event["event_type"] == "grafana_alert_resolved"]
+    assert len(events) == 1
+
+    duplicate = client.post("/alerts/grafana/webhook?token=grafana-test-token", json=resolved)
+    assert duplicate.json()["resolved_runs"] == 1
+    events = [event for event in list_audit_events(run_id) if event["event_type"] == "grafana_alert_resolved"]
+    assert len(events) == 1
 
 
 def test_plan_run_resets_mock_incident_state(monkeypatch, tmp_path: Path) -> None:

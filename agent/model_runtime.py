@@ -6,7 +6,7 @@ from threading import Lock
 from typing import Any, Dict
 from urllib.request import Request, urlopen
 
-from ops.settings import get_settings
+from runtime.settings import get_settings
 
 _STATE_LOCK = Lock()
 _MODEL_STATE: Dict[str, Any] = {
@@ -161,13 +161,23 @@ def active_model_status(force: bool = False) -> Dict[str, Any]:
             )
         else:
             probe = _probe_ollama(settings.planner_base_url, settings.planner_probe_timeout_seconds)
+        models = probe.get("models", [])
+        configured_model = settings.planner_model
+        model_available = configured_model in models or (
+            settings.planner_provider not in {"openai", "openai_compatible"}
+            and ":" not in configured_model
+            and f"{configured_model}:latest" in models
+        )
         probe.update(
             {
-                "status": "ready",
-                "ready": True,
+                "status": "ready" if model_available else "missing_model",
+                "ready": model_available,
                 "provider": settings.planner_provider,
                 "model": settings.planner_model,
-                "detail": "Model endpoint is reachable.",
+                "detail": (
+                    "Configured model is installed; inference has not been tested by this probe."
+                    if model_available else f"Endpoint is reachable but model '{configured_model}' is not installed."
+                ),
             }
         )
         with _STATE_LOCK:

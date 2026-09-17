@@ -13,6 +13,8 @@ class StructuredAction(TypedDict, total=False):
     reason: str
     execution_model: str
     manifest_path: str
+    current_version: str
+    previous_version: str
 
 
 class TraceStep(TypedDict, total=False):
@@ -32,6 +34,7 @@ class AgentState(TypedDict, total=False):
     run_id: str
     incident_id: str
     incident: Dict[str, Any]
+    incident_context: Dict[str, Any]
     service_memory: Dict[str, Any]
     infrastructure_memory: Dict[str, Any]
     integration_summary: List[Dict[str, Any]]
@@ -40,6 +43,7 @@ class AgentState(TypedDict, total=False):
 
     tool_mode: str
     execution_mode: str
+    evaluation_profile: str
     approved: bool
 
     retrieved: List[Dict[str, Any]]
@@ -79,6 +83,13 @@ class AgentState(TypedDict, total=False):
     rollback_record: Dict[str, Any]
     executor_transport: str
     evidence: Dict[str, Any]
+    evidence_ledger: List[Dict[str, Any]]
+    hypotheses: List[Dict[str, Any]]
+    situation_summary: str
+    evidence_gate: Dict[str, Any]
+    incident_report: Dict[str, Any]
+    claim_validation: Dict[str, Any]
+    remediation_options: List[Dict[str, Any]]
     evidence_graph: List[Dict[str, Any]]
     specialist_findings: List[Dict[str, Any]]
     evidence_after: Dict[str, Any]
@@ -88,6 +99,10 @@ class AgentState(TypedDict, total=False):
     latency_metrics: Dict[str, Any]
     coordinator_summary: Dict[str, Any]
     investigation_activity: List[Dict[str, Any]]
+    incident_brief: Dict[str, Any]
+    approval_summary: Dict[str, Any]
+    handoff_summary: Dict[str, Any]
+    verification_summary: Dict[str, Any]
     tool_confirmation_required: bool
     tool_confirmation_prompt: str
     tool_confirmation_tool: str

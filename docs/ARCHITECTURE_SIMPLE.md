@@ -1,285 +1,45 @@
-# Simple Architecture
+# Architecture
 
-This is the shortest useful explanation of the project.
-
-## What This Project Does
-
-This project is an `AI Assistant for SRE`.
-
-It helps with this flow:
-
-1. an alert or incident comes in
-2. the system gathers context
-3. it investigates with tools
-4. it suggests a likely diagnosis
-5. it suggests a safe action
-6. a human approves or rejects
-7. if approved, it executes
-8. it verifies whether the issue improved
-
-That is the whole product.
-
-## Main Flow
-
-```text
-Alert/UI
-   ->
-API
-   ->
-LangGraph Investigation Flow
-   ->
-Tools / MCP
-   ->
-Diagnosis + Proposed Action
-   ->
-Human Approval
-   ->
-Executor
-   ->
-Verification
-```
-
-## Tiny Diagram
+SRE Copilot investigates an incident, proposes one bounded remediation, and lets an operator approve it and inspect recovery. The supported diagnoses are OOM/crash loop, dependency 503, deployment regression and DNS failure. Uncertain cases escalate.
 
 ```mermaid
-flowchart TD
-    A[Alert or User Request] --> B[API]
-    B --> C[LangGraph Investigation]
-    C --> D[Tools and MCP]
+flowchart LR
+    A[Browser or alert webhook] --> B[FastAPI and run storage]
+    B --> C[Investigation job]
+    C --> D[Planner and read tools]
     D --> C
-    C --> E[Diagnosis and Proposed Action]
-    E --> F[Human Approval]
+    C --> E[Evidence and exact proposal]
+    E --> F[Human approval]
     F --> G[Executor]
-    G --> H[Verification]
-    H --> I[Stored Run History]
+    G --> H[Recovery checks and audit]
+    H --> B
 ```
 
-## The 4 Layers
+## Investigation
 
-### 1. Input Layer
+`agent/langgraph_agent.py` coordinates the bounded loop. Retrieval supplies runbook context; Kubernetes, metrics and log tools supply observations. The model proposes hypotheses and next read tools. Deterministic evidence checks and catalog preconditions constrain its decisions. Model errors are recorded with explicit fallback.
 
-Files:
-- `ui/app.py`
-- `ops/api.py`
-- `ops/alert_sources.py`
+`agent/specialists.py` contains ordinary evidence summarizers, not independent LLM agents. Service memory stores owners, dashboards and reviewed historical outcomes; it is context rather than proof of the current cause.
 
-What it does:
-- accepts incidents from the UI
-- accepts alerts from Grafana or a generic webhook
-- starts a run
+## Approval and execution
 
-Think of this as the front door.
+The API authenticates the operator, checks action authorization, validates the stored proposal/evidence hash and expiry, and claims a pending approval atomically. `runtime/job_runner.py` executes the stored action without replanning. `executor/service.py` claims each execution ID before an external side effect; duplicate or uncertain requests cannot silently execute again.
 
-### 2. Investigation Layer
+The executor is a trusted internal service protected by its shared token. Live Kubernetes writes go through a namespace-limited gateway. Preview performs no writes. Simulation changes only fixture state. GitOps currently produces local change artifacts; it does not merge a remote pull request or observe a delivery controller.
 
-Files:
-- `agent/langgraph_agent.py`
-- `agent/planner.py`
-- `agent/retrieval.py`
-- `agent/service_memory.py`
-- `agent/specialists.py`
-- `agent/evidence_graph.py`
+Verification reports configured recovery checks and sampled telemetry. A relative improvement alone is not resolution. Catalog thresholds belong to the demo and must be replaced with service-specific operational criteria.
 
-What it does:
-- loads incident context
-- retrieves runbook and project context
-- asks tools for evidence
-- ranks likely causes
-- proposes the next step
+## Runtime and evaluation
 
-This is the heart of the system.
+FastAPI serves the native HTML/CSS/JavaScript workbench. No frontend build service is required. Local startup uses SQLite and an in-process queue; the optional Compose profile uses Postgres and Redis.
 
-### 3. Action Control Layer
+The evaluation endpoint starts a separate preview benchmark process with an isolated database and mock state. The UI compares profiles and exposes case-level diagnoses and fallback errors. Groundedness validates structured alert/diagnosis claims only; confidence is heuristic. Historical lab results are dated evidence, not a certification of new changes.
 
-Files:
-- `ops/api.py`
-- `ops/auth.py`
-- `ops/job_runner.py`
-- `executor/service.py`
+## Operational limits
 
-What it does:
-- asks for human approval
-- executes approved actions
-- records audit and rollback data
-- verifies whether the alert recovered
+- The local queue and evaluation supervisor belong to one API process. Redis jobs survive while queued, but the current popped-job delivery has no crash recovery.
+- An interrupted write can have an uncertain outcome. Inspect actual infrastructure before deciding on another action.
+- The supplied Compose credentials and scenario thresholds are for a disposable lab. Host ports bind to loopback by default.
+- Broader datasets, independent SRE review and live failure/restart testing are required before production deployment.
 
-This is the safety layer.
-
-### 4. Memory Layer
-
-Files:
-- `ops/storage.py`
-- `ops/models.py`
-- `agent/service_memory.py`
-
-What it stores:
-- runs
-- approvals
-- execution results
-- rollback records
-- previous incidents
-- service memory
-- service history
-
-This is why the system can answer questions about previous runs.
-
-## What Is Service Memory?
-
-`Service memory` is just saved context about a service.
-
-Examples:
-- owner team
-- dashboards
-- recent deploys
-- previous incidents
-- known patterns
-
-Why it exists:
-- so the investigation does not start blind every time
-- so investigations have more context
-- so previous incidents can help with current ones
-
-Simple definition:
-
-`service memory = background context for a service`
-
-It is not magical memory. It is stored operational context.
-
-## What Are Specialists?
-
-Files:
-- `agent/specialists.py`
-
-Right now, specialists are not full independent AI agents.
-
-They are focused analyzers for different evidence types:
-- metrics
-- logs
-- change/deploy context
-
-Each specialist produces a short finding.
-Then the system combines them into one coordinator summary.
-
-Simple definition:
-
-`specialists = focused evidence summaries`
-
-They exist so one giant reasoning step does not have to do everything at once.
-
-## What Is The Coordinator Summary?
-
-This is just the merged view of the specialist findings.
-
-Example:
-- metrics says error rate is high
-- logs say DNS lookups are failing
-- change context says no recent deploy happened
-
-Then the coordinator summary says:
-- DNS is the strongest current explanation
-- logs and metrics support it
-- deploy regression looks less likely
-
-Simple definition:
-
-`coordinator summary = one combined investigation explanation`
-
-## What Is AI And What Is Deterministic?
-
-### AI parts
-
-Files:
-- `agent/planner.py`
-
-What AI does:
-- decide the next investigation step
-- decide whether to call another tool
-- decide whether to propose an action or escalate
-
-### Deterministic parts
-
-Files:
-- `agent/retrieval.py`
-- `agent/evidence_graph.py`
-- `agent/deterministic_policy.py`
-- `ops/job_runner.py`
-- executor files
-
-What deterministic code does:
-- retrieval
-- ranking
-- tool execution
-- action normalization
-- approval checks
-- execution
-- verification
-- audit and storage
-
-Simple rule:
-
-`AI decides`
-
-`deterministic code verifies, stores, and executes safely`
-
-## What To Ignore For Now
-
-If the repo feels too big, ignore these at first:
-- integration registry details
-- generic alert adapters
-- platform overview page
-- queue/worker internals
-
-Focus only on this:
-
-1. alert comes in
-2. system loads service context
-3. planner chooses tools
-4. tools return evidence
-5. system ranks likely causes
-6. system proposes a safe action
-7. human approves
-8. system verifies recovery
-
-If you understand that flow, you understand the product.
-
-## File Map
-
-If you only want the minimum set of files:
-
-- `ops/api.py`: entrypoint
-- `agent/langgraph_agent.py`: main workflow
-- `agent/planner.py`: AI reasoning
-- `agent/retrieval.py`: context retrieval
-- `agent/service_memory.py`: stored service context
-- `agent/specialists.py`: focused evidence summaries
-- `agent/evidence_graph.py`: evidence ranking and citations
-- `ops/storage.py`: saved runs and history
-- `executor/service.py`: safe execution
-
-That is the smallest useful reading list.
-
-## Read These 5 Files First
-
-If you want the fastest path to understanding the repo, read only these 5 files first:
-
-1. `ops/api.py`
-   - the front door
-   - shows how runs are created and how alerts enter the system
-
-2. `agent/langgraph_agent.py`
-   - the main investigation workflow
-   - shows the full incident flow end to end
-
-3. `agent/planner.py`
-   - the AI reasoning step
-   - shows where Ollama is used and where fallback happens
-
-4. `agent/retrieval.py`
-   - the context and runbook retrieval layer
-   - shows how the system finds relevant supporting information
-
-5. `executor/service.py`
-   - the safe execution layer
-   - shows how approved actions are actually run
-
-If those 5 files make sense, the rest of the repo becomes much easier to place.
+See [the project map](../PROJECT_STRUCTURE.md) for file ownership and [the rebuild record](REBUILD.md) for current verification status.

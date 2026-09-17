@@ -7,8 +7,8 @@ from uuid import uuid4
 
 from executor.schemas import ExecutionRequest, RollbackRequest
 from executor.service import ExecutionService
-from ops.runtime import run_with_retry
-from ops.settings import get_settings
+from runtime.resilience import run_with_retry
+from runtime.settings import get_settings
 
 
 class ExecutorClient:

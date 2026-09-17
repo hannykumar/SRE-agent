@@ -1,6 +1,6 @@
 # SRE Copilot
 
-> **Publication status:** This README describes the September 2026 local rebuild. The corresponding application changes and supporting documents have not yet been published to this branch; the commands and file references below apply to that rebuild. Final authenticated recovery-screen verification passed on September 17, 2026.
+> **Rebuild status:** The September 2026 workbench rebuild is complete. Final authenticated recovery-screen verification passed on September 17, 2026. This is a focused portfolio prototype, not a production certification.
 
 An evidence-grounded incident investigation and human-approved remediation workbench. A master's portfolio project using Kubernetes, Grafana, Prometheus, Loki, LangGraph and a local LLM.
 
@@ -46,7 +46,7 @@ PYTHONPATH=. .venv/bin/python -m evaluation.benchmark_matrix \
   --output eval_history/comparison.json
 ```
 
-Historical evidence covers 20 fixture-derived replays per completed profile and five Kind/Grafana scenario contracts. Hybrid accuracy matched the deterministic baseline and exceeded LLM-only accuracy. These small local results do not establish general production safety. The local rebuild's `NORTH_STAR.md` records dated evidence and limitations; `docs/REBUILD.md` contains the current audit.
+Historical evidence covers 20 fixture-derived replays per completed profile and five Kind/Grafana scenario contracts. Hybrid accuracy matched the deterministic baseline and exceeded LLM-only accuracy. These small local results do not establish general production safety. [NORTH_STAR.md](NORTH_STAR.md) records dated evidence and limitations; [docs/REBUILD.md](docs/REBUILD.md) contains the current audit.
 
 Groundedness currently validates two structured claims (alert and diagnosis), not all model-written prose. Confidence is a heuristic ranking, not a calibrated probability. Recovery is judged against catalog thresholds: the demo 503 threshold is 20% errors, which is not a production SLO. Configure service-specific recovery criteria before operational use.
 
@@ -61,12 +61,12 @@ Benchmark accuracy is the workflow's final diagnosis after deterministic control
 ./lab/scripts/kind_lab_reset.sh
 ```
 
-See `lab/k8s/README.md` in the local rebuild. Cases cover OOM, dependency 503, deployment regression, DNS failure and uncertain escalation. Live execution requires explicit approval. GitOps proposals remain `inconclusive` until an external rollout is observed.
+See [lab/k8s/README.md](lab/k8s/README.md). Cases cover OOM, dependency 503, deployment regression, DNS failure and uncertain escalation. Live execution requires explicit approval. GitOps proposals remain `inconclusive` until an external rollout is observed.
 
 For the larger Postgres/Redis container profile, use `docker compose up --build`. Optional database admin UIs require `--profile admin-tools`; the observability demo uses `--profile alert-lab`.
 
 ## Read the code
 
-In the local rebuild, start with `PROJECT_STRUCTURE.md`, then `docs/ARCHITECTURE_SIMPLE.md`. Active product code lives in `agent/`, `runtime/`, `integrations/`, `executor/` and `frontend/`. Evaluation checks behavior; lab fixtures, configuration and runbooks define the focused scenarios.
+Start with [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md), then [docs/ARCHITECTURE_SIMPLE.md](docs/ARCHITECTURE_SIMPLE.md). Active product code lives in `agent/`, `runtime/`, `integrations/`, `executor/` and `frontend/`. Evaluation checks behavior; lab fixtures, configuration and runbooks define the focused scenarios.
 
 Old implementations remain in ignored `archive/`. Runtime databases, traces, artifacts and evaluation history are generated local data.

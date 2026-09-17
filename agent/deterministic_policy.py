@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from agent.evidence_graph import confirmation_from_rankings, rank_diagnoses
@@ -12,44 +13,22 @@ ALLOWED_READ_TOOLS = allowed_catalog_tools()
 ALLOWED_ACTION_TYPES = allowed_catalog_actions()
 
 
-def infer_incident_type_from_filename(name: str) -> str:
-    lowered = name.lower()
-    if "database" in lowered or "db_" in lowered or "db-" in lowered:
-        return "DatabaseConnectionFailure"
-    if "tls" in lowered or "certificate" in lowered or "x509" in lowered:
-        return "TLSCertificateExpiry"
-    if "node_not_ready" in lowered or "node" in lowered:
-        return "NodeNotReady"
-    if "disk" in lowered or "storage" in lowered:
-        return "DiskPressure"
-    if "queue" in lowered or "worker_lag" in lowered or "backlog" in lowered:
-        return "QueueBacklog"
-    if "dependency" in lowered or "latency" in lowered:
-        return "DependencyLatency"
-    if "deploy" in lowered or "regression" in lowered or "release" in lowered:
-        return "DeploymentRegression"
-    if "dns" in lowered:
-        return "DNSFailure"
-    if "503" in lowered or "upstream" in lowered:
-        return "Service503"
-    if "crashloop" in lowered or "oom" in lowered:
-        return "CrashLoopBackOff"
-    if "cpu" in lowered:
-        return "HighCPU"
-    if "memory" in lowered:
-        return "HighMemory"
-    return "Unknown"
-
-
-def choose_primary_incident_type(retrieved: List[Dict[str, Any]]) -> str:
-    if not retrieved:
-        return "Unknown"
-    first = str(retrieved[0].get("incident_type") or "Unknown")
-    first_score = float(retrieved[0].get("score", 0.0) or 0.0)
-    second_score = float(retrieved[1].get("score", 0.0) or 0.0) if len(retrieved) > 1 else 0.0
-    if first == "Unknown" or second_score >= first_score * 0.95:
-        return "Unknown"
-    return first
+def incident_routing_hint(incident: Dict[str, Any]) -> str:
+    """Use provider metadata only to choose evidence tools, never to confirm a diagnosis."""
+    context = dict(incident.get("incident_context") or {})
+    labels = dict(context.get("labels") or {})
+    scenario = str(labels.get("scenario") or "").strip().lower().replace("-", "_")
+    scenario_types = {
+        "crashloop": "CrashLoopBackOff",
+        "oom": "CrashLoopBackOff",
+        "service503": "Service503",
+        "dependency503": "Service503",
+        "deployment_regression": "DeploymentRegression",
+        "dnsfailure": "DNSFailure",
+        "dns_failure": "DNSFailure",
+    }
+    hinted = scenario_types.get(scenario, "")
+    return hinted if incident_definition(hinted) is not None else ""
 
 
 def tool_args_for(tool_name: str, state: AgentState) -> Dict[str, Any]:
@@ -58,6 +37,20 @@ def tool_args_for(tool_name: str, state: AgentState) -> Dict[str, Any]:
     pod_name = pod_status.get("pod_name") or incident.get("pod_status", {}).get("pod_name")
     service = str(incident.get("service", ""))
     namespace = str(incident.get("namespace", "default"))
+    context = dict(state.get("incident_context") or {})
+    now = datetime.now(timezone.utc)
+    try:
+        end_at = datetime.fromisoformat(str(context.get("received_at") or now.isoformat()).replace("Z", "+00:00"))
+        start_at = datetime.fromisoformat(
+            str(context.get("started_at") or (end_at - timedelta(minutes=15)).isoformat()).replace("Z", "+00:00")
+        )
+        if start_at >= end_at or end_at - start_at > timedelta(hours=2):
+            start_at = end_at - timedelta(minutes=15)
+    except ValueError:
+        end_at = now
+        start_at = now - timedelta(minutes=15)
+    start = start_at.astimezone(timezone.utc).isoformat()
+    end = end_at.astimezone(timezone.utc).isoformat()
 
     if tool_name == "get_pod_status":
         return {"service": service, "namespace": namespace}
@@ -66,13 +59,21 @@ def tool_args_for(tool_name: str, state: AgentState) -> Dict[str, Any]:
     if tool_name == "get_metrics":
         return {"service": service, "namespace": namespace}
     if tool_name == "get_pod_logs":
-        return {"pod_name": pod_name, "namespace": namespace, "lines": 200}
+        return {"pod_name": pod_name, "namespace": namespace, "lines": 200, "since_time": start}
     if tool_name == "get_cluster_events":
         return {"namespace": namespace}
+    if tool_name == "get_kubernetes_events":
+        return {"namespace": namespace}
+    if tool_name == "get_deployment":
+        return {"service": service, "namespace": namespace}
     if tool_name == "query_prometheus":
         return {"expression": f"service_health_score{{service=\"{service}\",namespace=\"{namespace}\"}}"}
+    if tool_name == "query_prometheus_range":
+        return {"expression": f"service_health_score{{service=\"{service}\",namespace=\"{namespace}\"}}", "start": start, "end": end, "step_seconds": 30}
     if tool_name == "query_loki":
         return {"service": service, "namespace": namespace, "limit": 50}
+    if tool_name == "query_loki_range":
+        return {"query": f'{{service="{service}",namespace="{namespace}"}}', "start": start, "end": end, "limit": 50}
     if tool_name == "query_tempo":
         return {"service": service, "namespace": namespace, "limit": 20}
     if tool_name == "get_dashboard_context":
@@ -83,10 +84,29 @@ def tool_args_for(tool_name: str, state: AgentState) -> Dict[str, Any]:
         return {"service": service}
     if tool_name == "get_incident_history":
         return {"service": service, "limit": 10}
+    if tool_name == "get_git_diff":
+        return {"service": service, "namespace": namespace}
+    if tool_name == "get_service_dependencies":
+        return {"service": service, "namespace": namespace}
+    if tool_name == "search_runbooks":
+        return {"query": str(incident.get("description") or service), "limit": 5}
+    if tool_name == "search_previous_incidents":
+        return {"service": service, "limit": 10}
     return {"service": service, "namespace": namespace}
 
 
+def ensure_tool_prerequisites(tool_name: str, state: AgentState) -> str:
+    """Route tools with object-level arguments through discovery first."""
+    if tool_name in {"get_pod_logs", "describe_pod"}:
+        pod_status = state.get("tool_results", {}).get("get_pod_status")
+        if not isinstance(pod_status, dict) or not str(pod_status.get("pod_name") or "").strip():
+            return "get_pod_status"
+    return tool_name
+
+
 def summarize_observation(tool_name: str, observation: Any) -> str:
+    if not isinstance(observation, (dict, list)):
+        return str(observation)
     if tool_name == "get_pod_status":
         return f"pod={observation.get('pod_name')} restarts={observation.get('restarts')} phase={observation.get('phase')}"
     if tool_name == "describe_pod":
@@ -128,24 +148,46 @@ def summarize_observation(tool_name: str, observation: Any) -> str:
             return "no recent incident history"
         latest = incidents[0]
         return f"history={latest.get('type', 'unknown')} {latest.get('hours_ago', 'n/a')}h ago"
+    if tool_name == "get_service_dependencies":
+        unavailable = observation.get("unavailable", []) if isinstance(observation, dict) else []
+        if unavailable:
+            names = ", ".join(str(item.get("name") or "unknown") for item in unavailable if isinstance(item, dict))
+            return f"unavailable_dependencies={names}"
+        dependencies = observation.get("dependencies", []) if isinstance(observation, dict) else []
+        return f"dependencies_checked={len(dependencies)}; none confirmed unavailable"
     return str(observation)
 
 
 def evidence_from_tools(state: AgentState) -> Dict[str, Any]:
     tools = state.get("tool_results", {})
+    # Fixture payloads model the environment behind mock tools. For a real alert
+    # they must not count as already-observed evidence before a tool is called.
+    embedded = {} if state.get("incident_context") else state.get("incident", {})
+    def mapping(value: Any, fallback: Any = None) -> Dict[str, Any]:
+        candidate = fallback if value is None else value
+        return candidate if isinstance(candidate, dict) else {}
+
+    def sequence(value: Any, fallback: Any = None) -> list[Any]:
+        candidate = fallback if value is None else value
+        return candidate if isinstance(candidate, list) else []
+
     return {
-        "pod_status": tools.get("get_pod_status", state.get("incident", {}).get("pod_status", {})),
-        "pod_describe": tools.get("describe_pod", state.get("incident", {}).get("pod_describe", {})),
-        "metrics": tools.get("get_metrics", state.get("incident", {}).get("metrics", {})),
-        "logs_tail": tools.get("get_pod_logs", state.get("incident", {}).get("logs_tail", [])),
-        "cluster_events": tools.get("get_cluster_events", state.get("incident", {}).get("cluster_events", [])),
-        "prometheus": tools.get("query_prometheus", {}),
-        "loki": tools.get("query_loki", {}),
-        "tempo": tools.get("query_tempo", {}),
-        "dashboard_context": tools.get("get_dashboard_context", {}),
-        "recent_deploys": tools.get("get_recent_deploys", []),
-        "service_owner": tools.get("get_service_owner", {}),
-        "incident_history": tools.get("get_incident_history", []),
+        "pod_status": mapping(tools.get("get_pod_status"), embedded.get("pod_status", {})),
+        "pod_describe": mapping(tools.get("describe_pod"), embedded.get("pod_describe", {})),
+        "metrics": mapping(tools.get("get_metrics"), embedded.get("metrics", {})),
+        "logs_tail": sequence(tools.get("get_pod_logs"), embedded.get("logs_tail", [])),
+        "cluster_events": sequence(tools.get("get_kubernetes_events", tools.get("get_cluster_events")), embedded.get("cluster_events", [])),
+        "deployment": mapping(tools.get("get_deployment")),
+        "prometheus": mapping(tools.get("query_prometheus_range", tools.get("query_prometheus"))),
+        "loki": mapping(tools.get("query_loki_range", tools.get("query_loki"))),
+        "tempo": mapping(tools.get("query_tempo")),
+        "dashboard_context": mapping(tools.get("get_dashboard_context")),
+        "recent_deploys": sequence(tools.get("get_recent_deploys"), embedded.get("recent_deploys", [])),
+        "service_owner": mapping(tools.get("get_service_owner")),
+        "incident_history": sequence(tools.get("search_previous_incidents", tools.get("get_incident_history"))),
+        "git_diff": mapping(tools.get("get_git_diff")),
+        "service_dependencies": mapping(tools.get("get_service_dependencies")),
+        "runbook_search": sequence(tools.get("search_runbooks")),
     }
 
 
@@ -162,7 +204,7 @@ def diagnose_from_evidence(state: AgentState) -> Dict[str, Any]:
 
 def missing_tool(state: AgentState) -> str:
     seen = state.get("tool_results", {})
-    predicted_type = state.get("predicted_type", "Unknown")
+    predicted_type = incident_routing_hint(state.get("incident", {})) or state.get("predicted_type", "Unknown")
     definition = incident_definition(predicted_type) if predicted_type != "Unknown" else None
     if definition is None and state.get("candidate_diagnoses"):
         top_candidate = str(state.get("candidate_diagnoses", [{}])[0].get("incident_type", "Unknown"))
@@ -211,19 +253,14 @@ def _condition_matches(incident: Dict[str, Any], evidence: Dict[str, Any], condi
     return False
 
 
-def build_action(incident: Dict[str, Any], diagnosis: str, evidence: Dict[str, Any]) -> StructuredAction:
+def build_action(incident: Dict[str, Any], diagnosis: str, evidence: Dict[str, Any]) -> StructuredAction | None:
     definition = incident_definition(diagnosis)
     namespace = str(incident.get("namespace") or "default")
     service = str(incident.get("service") or "service")
     replicas = int((evidence.get("pod_status") or {}).get("replicas", incident.get("pod_status", {}).get("replicas", 1)) or 1)
 
     if definition is None:
-        return {
-            "action_type": "restart_pod",
-            "target": service,
-            "namespace": namespace,
-            "reason": "Fallback restart because the diagnosis did not map to a catalog action.",
-        }
+        return None
 
     for template in definition.safe_actions:
         conditions = list(template.get("conditions", []))
@@ -231,26 +268,39 @@ def build_action(incident: Dict[str, Any], diagnosis: str, evidence: Dict[str, A
             continue
         params = dict(template.get("params", {}))
         action_type = str(template.get("action_type", "restart_pod"))
+        target = str(template.get("target") or ("coredns" if action_type == "restart_coredns" else service))
+        action_namespace = str(template.get("namespace") or ("kube-system" if action_type == "restart_coredns" else namespace))
+        previous_replicas = replicas
+        if template.get("target_source") == "first_unavailable_dependency":
+            unavailable = list((evidence.get("service_dependencies") or {}).get("unavailable") or [])
+            candidate = dict(unavailable[0]) if unavailable and isinstance(unavailable[0], dict) else {}
+            if type(candidate.get("replicas")) is not int or candidate["replicas"] != 0:
+                continue
+            target = str(candidate.get("name") or "").strip()
+            action_namespace = str(candidate.get("namespace") or namespace)
+            previous_replicas = 0
+            if not target:
+                continue
         action: StructuredAction = {
             "action_type": action_type,
-            "target": str(template.get("target") or ("coredns" if action_type == "restart_coredns" else service)),
-            "namespace": str(template.get("namespace") or ("kube-system" if action_type == "restart_coredns" else namespace)),
+            "target": target,
+            "namespace": action_namespace,
             "reason": str(template.get("reason", "Safe catalog action.")),
         }
         if action_type in {"scale_deployment", "gitops_scale_deployment"}:
             action["replicas"] = int(params.get("replicas", max(replicas + 1, 2)))
-            action["previous_replicas"] = replicas
+            action["previous_replicas"] = previous_replicas
         if action_type == "gitops_scale_deployment":
             action["execution_model"] = "gitops"
             action["manifest_path"] = str(incident.get("gitops_manifest_path") or f"clusters/{namespace}/{service}.json")
+        if action_type == "gitops_rollback_deployment":
+            action["execution_model"] = "gitops"
+            action["manifest_path"] = str(incident.get("gitops_manifest_path") or f"clusters/{namespace}/{service}.json")
+            action["current_version"] = str(params.get("current_version") or incident.get("current_version") or "current")
+            action["previous_version"] = str(params.get("previous_version") or incident.get("previous_version") or "previous")
         return action
 
-    return {
-        "action_type": "restart_pod",
-        "target": service,
-        "namespace": namespace,
-        "reason": f"Fallback restart for {diagnosis} because no catalog template matched.",
-    }
+    return None
 
 
 def deterministic_decision(state: AgentState) -> Dict[str, Any]:
@@ -262,15 +312,39 @@ def deterministic_decision(state: AgentState) -> Dict[str, Any]:
     if bool(diagnosis["confirmed"]):
         proposed_action = build_action(state["incident"], diagnosis_name, evidence)
         top_ranking = (diagnosis.get("rankings") or [{}])[0]
-        rationale = "; ".join(top_ranking.get("rationale", [])) or f"Evidence is strong enough to diagnose {diagnosis_name}."
+        rationale = (
+            "; ".join(top_ranking.get("rationale", []))
+            or f"Evidence is strong enough to diagnose {diagnosis_name}."
+        )[:280]
+        if proposed_action is not None:
+            return {
+                "thought_summary": rationale,
+                "hypothesis": diagnosis_name,
+                "confidence": confidence,
+                "decision": "propose_action",
+                "tool_name": None,
+                "proposed_action": proposed_action,
+                "escalation_reason": None,
+            }
+        next_tool = missing_tool(state)
+        if next_tool and int(state.get("step_count", 0)) <= int(state.get("max_steps", 4)):
+            return {
+                "thought_summary": f"{rationale} Gather {next_tool} before deciding whether any catalog action is safe.",
+                "hypothesis": diagnosis_name,
+                "confidence": confidence,
+                "decision": "call_tool",
+                "tool_name": next_tool,
+                "proposed_action": None,
+                "escalation_reason": None,
+            }
         return {
-            "thought_summary": rationale,
+            "thought_summary": f"{rationale} No catalog action satisfies the observed preconditions.",
             "hypothesis": diagnosis_name,
             "confidence": confidence,
-            "decision": "propose_action",
+            "decision": "escalate",
             "tool_name": None,
-            "proposed_action": proposed_action,
-            "escalation_reason": None,
+            "proposed_action": None,
+            "escalation_reason": f"Diagnosis {diagnosis_name} is supported, but no preconditioned safe action is available.",
         }
 
     next_tool = missing_tool(state)

@@ -4,8 +4,8 @@ import json
 import time
 from typing import Any, Callable, Dict
 
-from mcp_tools.live_backends import LiveSREBackend
-from ops.settings import get_settings
+from integrations.live_backends import LiveSREBackend
+from runtime.settings import get_settings
 
 
 LIVE_TOOLS: dict[str, Callable[[LiveSREBackend, str, str], Any]] = {

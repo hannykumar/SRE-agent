@@ -63,12 +63,13 @@ groups:
           description: The alert lab demo service is returning 503 responses and should map to INC-002.
         labels:
           severity: warning
-          service: demo-api
+          service: api
           lab: alert-lab
           incident_id: INC-002
           scenario: service503
-      - uid: demo_api_crashloop_signal
-        title: Demo API CrashLoop OOM Signal
+
+      - uid: demo_checkout_crashloop_signal
+        title: Demo Checkout CrashLoop OOM Signal
         condition: B
         data:
           - refId: A
@@ -124,12 +125,13 @@ groups:
           description: The alert lab demo service is simulating a CrashLoopBackOff OOM scenario and should map to INC-001.
         labels:
           severity: warning
-          service: demo-api
+          service: checkout
           lab: alert-lab
           incident_id: INC-001
           scenario: crashloop
-      - uid: demo_api_dns_failure_signal
-        title: Demo API DNS Failure Signal
+
+      - uid: demo_worker_dns_failure_signal
+        title: Demo Worker DNS Failure Signal
         condition: B
         data:
           - refId: A
@@ -185,7 +187,7 @@ groups:
           description: The alert lab demo service is simulating resolver failures and should map to INC-003.
         labels:
           severity: warning
-          service: demo-api
+          service: worker
           lab: alert-lab
           incident_id: INC-003
           scenario: dnsfailure

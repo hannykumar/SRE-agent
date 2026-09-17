@@ -6,8 +6,10 @@ from typing import Any, Dict, List
 import agent.langgraph_agent as lg
 from agent.model_runtime import reset_model_runtime_state
 import agent.planner as planner
-from mcp_tools.mock_mcp import MockMCP
-from ops.settings import reset_settings_cache
+import agent.retrieval as retrieval
+from integrations.mock_mcp import MockMCP
+from runtime.resilience import RetryableOperationError, run_with_retry
+from runtime.settings import reset_settings_cache
 
 
 def _fake_retrieval(_query: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -66,29 +68,41 @@ def setup_function() -> None:
     MockMCP.reset_live_state()
 
 
+def test_model_cannot_propose_when_deterministic_preconditions_fail(monkeypatch):
+    monkeypatch.setattr(planner, "deterministic_decision", lambda state: {
+        "thought_summary": "Insufficient evidence", "hypothesis": "Unknown", "confidence": .1,
+        "decision": "escalate", "escalation_reason": "Missing prerequisites",
+    })
+    decision = planner.AgentDecision(thought_summary="Scale anyway", hypothesis="Service503", confidence=.99,
+        decision="propose_action", proposed_action=planner.PlannerAction(action_type="scale_deployment", target="payments", replicas=1))
+    guarded = planner._apply_deterministic_guardrails({}, decision)
+    assert guarded.decision == "escalate"
+    assert guarded.proposed_action is None
+
+
 def test_ollama_planner_path(monkeypatch) -> None:
     monkeypatch.setenv("SRE_AGENT_PLANNER_PROVIDER", "ollama")
     monkeypatch.setenv("SRE_AGENT_PLANNER_MODEL", "qwen3:4b")
     reset_settings_cache()
     MockMCP.reset_live_state()
-    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_retrieval)
+    monkeypatch.setattr(lg, "retrieve_runbook_chunks", _fake_retrieval_for_query)
 
     ollama_payload = {
         "message": {
             "content": json.dumps(
                 {
-                    "thought_summary": "OOM evidence is already clear from the incident context. Propose a safe GitOps scale-up.",
-                    "hypothesis": "CrashLoopBackOff",
+                    "thought_summary": "The payments deployment is confirmed unavailable. Restore exactly one replica.",
+                    "hypothesis": "Service503",
                     "confidence": 0.94,
                     "decision": "propose_action",
                     "tool_name": None,
                     "proposed_action": {
-                        "action_type": "gitops_scale_deployment",
-                        "target": "checkout",
+                        "action_type": "scale_deployment",
+                        "target": "payments",
                         "namespace": "prod",
-                        "replicas": 2,
-                        "previous_replicas": 1,
-                        "reason": "Increase replicas after repeated crash evidence.",
+                        "replicas": 1,
+                        "previous_replicas": 0,
+                        "reason": "Restore the dependency after live workload evidence confirmed zero ready replicas.",
                     },
                     "escalation_reason": None,
                 }
@@ -97,12 +111,13 @@ def test_ollama_planner_path(monkeypatch) -> None:
     }
     monkeypatch.setattr(planner, "urlopen", lambda req, timeout=20: _FakeOllamaResponse(ollama_payload))
 
-    out = lg.run_incident_langgraph("INC-001", approved=False)
+    out = lg.run_incident_langgraph("INC-002", approved=False)
 
     assert out["planner_backend"] == "ollama"
-    assert out["diagnosis"] == "CrashLoopBackOff"
+    assert out["diagnosis"] == "Service503"
     assert out["confirmed"] is True
-    assert out["proposed_action"]["action_type"] == "gitops_scale_deployment"
+    assert out["proposed_action"]["action_type"] == "scale_deployment"
+    assert out["proposed_action"]["target"] == "payments"
     assert out["planned_commands"]
     reset_settings_cache()
 
@@ -132,7 +147,8 @@ def test_ollama_guardrail_recovers_service503_from_escalation(monkeypatch) -> No
     assert out["planner_backend"] == "ollama_guardrail"
     assert out["diagnosis"] == "Service503"
     assert out["confirmed"] is True
-    assert out["proposed_action"]["action_type"] == "restart_pod"
+    assert out["proposed_action"]["action_type"] == "scale_deployment"
+    assert out["proposed_action"]["target"] == "payments"
     assert out["planned_commands"]
     reset_settings_cache()
 
@@ -169,8 +185,10 @@ def test_ollama_guardrail_overrides_service503_conflicting_action(monkeypatch) -
     assert out["planner_backend"] == "ollama_guardrail"
     assert out["diagnosis"] == "Service503"
     assert out["confirmed"] is True
-    assert out["proposed_action"]["action_type"] == "restart_pod"
-    assert out["planned_commands"][0] == "kubectl delete pod -n prod -l app=api"
+    assert out["proposed_action"]["action_type"] == "scale_deployment"
+    assert out["proposed_action"]["target"] == "payments"
+    assert out["proposed_action"]["replicas"] == 1
+    assert out["planned_commands"][0] == "kubectl scale deployment payments -n prod --replicas=1"
     reset_settings_cache()
 
 
@@ -199,8 +217,10 @@ def test_ollama_guardrail_recovers_dnsfailure_from_escalation(monkeypatch) -> No
     assert out["planner_backend"] == "ollama_guardrail"
     assert out["diagnosis"] == "DNSFailure"
     assert out["confirmed"] is True
-    assert out["proposed_action"]["action_type"] == "restart_coredns"
-    assert out["planned_commands"]
+    assert out["proposed_action"] == {}
+    assert out["planned_commands"] == []
+    assert out["requires_human_approval"] is False
+    assert "no preconditioned safe action" in out["escalation_reason"].lower()
     reset_settings_cache()
 
 
@@ -218,6 +238,54 @@ def test_ollama_failure_enters_cooldown(monkeypatch) -> None:
     first = lg.run_incident_langgraph("INC-002", approved=False)
     second = lg.run_incident_langgraph("INC-002", approved=False)
 
-    assert first["planner_backend"] == "ollama_fallback"
-    assert second["planner_backend"] == "ollama_cooldown_fallback"
+    assert first["planner_backend"] == "ollama_run_fallback"
+    assert second["planner_backend"] == "ollama_run_fallback"
+    assert second["model_status"]["cooldown_active"] is True
     reset_settings_cache()
+
+
+def test_retry_query_uses_ai_rewrite_when_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("SRE_AGENT_PLANNER_PROVIDER", "ollama")
+    monkeypatch.setenv("SRE_AGENT_PLANNER_MODEL", "qwen3:4b")
+    reset_settings_cache()
+
+    payload = {
+        "message": {
+            "content": json.dumps(
+                {
+                    "query": "api upstream timeout 503 payments dependency latency"
+                }
+            )
+        }
+    }
+    monkeypatch.setattr(retrieval, "urlopen", lambda req, timeout=8: _FakeOllamaResponse(payload))
+
+    query = retrieval.build_retry_query(
+        {"incident_id": "INC-002", "service": "api", "namespace": "prod", "description": "users see 503 errors"},
+        {"metrics": {"error_rate_percent": 9}, "logs_tail": ["ERROR upstream timeout to payments"], "cluster_events": []},
+        [{"incident_type": "Service503", "score": 0.5}],
+    )
+
+    assert query == "api upstream timeout 503 payments dependency latency"
+    reset_settings_cache()
+
+
+def test_retry_error_preserves_underlying_exception_text() -> None:
+    def _boom():
+        raise TimeoutError("timed out")
+
+    try:
+        run_with_retry(
+            _boom,
+            retries=0,
+            timeout_seconds=1.0,
+            operation_name="planner:ollama",
+            retry_exceptions=(TimeoutError,),
+        )
+    except RetryableOperationError as exc:
+        text = str(exc)
+        assert "planner:ollama failed after 1 attempts" in text
+        assert "TimeoutError:" in text
+        assert "timed out" in text.lower()
+    else:
+        raise AssertionError("RetryableOperationError was not raised")

@@ -1,18 +1,47 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Dict, List
 
-from ops.storage import get_infrastructure_memory, get_or_create_service_memory, list_integrations
+from runtime.storage import get_infrastructure_memory, get_or_create_service_memory, list_integrations, list_operator_feedback
 
 
-def load_service_memory(service: str, namespace: str = "prod") -> Dict[str, Any]:
-    return get_infrastructure_memory(service, namespace=namespace) or {
+@lru_cache(maxsize=128)
+def _cached_service_memory(service: str, namespace: str) -> Dict[str, Any]:
+    payload = get_infrastructure_memory(service, namespace=namespace)
+    if payload:
+        enriched = dict(payload)
+        memory_payload = dict(enriched.get("payload") or {})
+        feedback = [
+            item
+            for item in list_operator_feedback(service=service, limit=25)
+            if item.get("diagnosis_correct") is True and int(item.get("rating", 0) or 0) >= 4
+        ]
+        memory_payload["validated_feedback_priors"] = [
+            {
+                "incident_type": item.get("incident_snapshot", {}).get("incident_type", "Unknown"),
+                "rating": item.get("rating"),
+                "run_id": item.get("run_id"),
+            }
+            for item in feedback[:5]
+        ]
+        enriched["payload"] = memory_payload
+        return enriched
+    return {
         "service": service,
         "namespace": namespace,
         "summary": "",
         "payload": {},
         "source": "none",
     }
+
+
+def load_service_memory(service: str, namespace: str = "prod") -> Dict[str, Any]:
+    return dict(_cached_service_memory(str(service or "").strip(), str(namespace or "prod").strip() or "prod"))
+
+
+def reset_service_memory_cache() -> None:
+    _cached_service_memory.cache_clear()
 
 
 

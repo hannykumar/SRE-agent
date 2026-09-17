@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import json
 import time
-from base64 import b64encode
 from typing import Any, Dict, List
-from urllib.parse import quote
-from urllib.request import Request, urlopen
 
 from executor.gitops import GitOpsExecutor
 from agent.incident_catalog import incident_definition
-from lab.scenarios import get_alert_lab_scenario, is_alert_lab_incident
-from mcp_tools.actions import normalize_action, render_action_to_command, rollback_action_for_action, rollback_command_for_action
-from mcp_tools.kubectl_client import KubectlMCPClient
-from mcp_tools.tool_gateway import get_tool_client
-from ops.settings import get_settings
+from integrations.actions import normalize_action, render_action_to_command, rollback_action_for_action, rollback_command_for_action
+from integrations.kubectl_client import KubectlMCPClient
+from integrations.tool_gateway import get_tool_client
+from runtime.settings import get_settings
 
 
 def assess_improvement(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
@@ -46,14 +41,19 @@ def assess_improvement(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[st
 def assess_verification_rules(diagnosis: str, before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
     definition = incident_definition(diagnosis)
     if definition is None:
-        return {"enabled": False, "resolved": False, "reason": "no_catalog_verification_rules", "checks": []}
+        return {
+            "enabled": False,
+            "resolved": False,
+            "status": "inconclusive",
+            "reason": "no_catalog_verification_rules",
+            "checks": [],
+        }
 
     before_metrics = before.get("metrics", {})
     after_metrics = after.get("metrics", {})
     after_logs = "\n".join(after.get("logs_tail", [])).lower()
     checks: List[Dict[str, Any]] = []
     passed_required = True
-    passed_any = False
 
     for rule in definition.verification_rules:
         if "metric" in rule:
@@ -64,6 +64,10 @@ def assess_verification_rules(diagnosis: str, before: Dict[str, Any], after: Dic
             passed = False
             if isinstance(before_value, (int, float)) and isinstance(after_value, (int, float)):
                 passed = after_value < before_value if direction == "decrease" else after_value > before_value
+                if rule.get("max_value") is not None:
+                    passed = passed and after_value <= float(rule["max_value"])
+                if rule.get("min_value") is not None:
+                    passed = passed and after_value >= float(rule["min_value"])
             checks.append(
                 {
                     "type": "metric",
@@ -71,6 +75,8 @@ def assess_verification_rules(diagnosis: str, before: Dict[str, Any], after: Dic
                     "direction": direction,
                     "before": before_value,
                     "after": after_value,
+                    "max_value": rule.get("max_value"),
+                    "min_value": rule.get("min_value"),
                     "passed": passed,
                     "optional": bool(rule.get("optional", False)),
                 }
@@ -89,193 +95,90 @@ def assess_verification_rules(diagnosis: str, before: Dict[str, Any], after: Dic
         else:
             continue
 
-        if checks[-1]["passed"]:
-            passed_any = True
         if not checks[-1]["optional"] and not checks[-1]["passed"]:
             passed_required = False
 
-    resolved = bool(checks) and passed_required and (passed_any or all(check.get("optional", False) for check in checks))
-    return {"enabled": bool(checks), "resolved": resolved, "reason": diagnosis, "checks": checks}
+    recovery_checks = [check for check in checks if not check.get("optional") and (
+        check["type"] == "log_absent" or check.get("max_value") is not None or check.get("min_value") is not None
+    )]
+    resolved = bool(recovery_checks) and passed_required
+    passed_count = sum(1 for check in checks if check.get("passed"))
+    failed_count = sum(1 for check in checks if not check.get("passed"))
+    if resolved:
+        status = "resolved"
+    elif checks and passed_count:
+        status = "improved"
+    elif checks and failed_count:
+        status = "unchanged"
+    else:
+        status = "inconclusive"
+    return {"enabled": bool(checks), "resolved": resolved, "status": status, "reason": diagnosis, "checks": checks}
 
 
-def _json_request(
-    method: str,
-    url: str,
+def classify_verification_outcome(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    rule_verification: Dict[str, Any],
     *,
-    body: Dict[str, Any] | None = None,
-    headers: Dict[str, str] | None = None,
-    basic_auth: tuple[str, str] | None = None,
-    timeout: float = 5.0,
-) -> Any:
-    merged_headers = {"Content-Type": "application/json"}
-    if headers:
-        merged_headers.update(headers)
-    if basic_auth:
-        token = b64encode(f"{basic_auth[0]}:{basic_auth[1]}".encode("utf-8")).decode("ascii")
-        merged_headers["Authorization"] = f"Basic {token}"
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    request = Request(url=url, data=data, headers=merged_headers, method=method)
-    with urlopen(request, timeout=timeout) as response:
-        raw = response.read().decode("utf-8")
-        return json.loads(raw) if raw else {}
+    timed_out: bool = False,
+) -> str:
+    if timed_out:
+        return "verification_timeout"
+    if rule_verification.get("resolved"):
+        return "resolved"
+
+    before_metrics = dict(before.get("metrics") or {})
+    after_metrics = dict(after.get("metrics") or {})
+    comparable = 0
+    improved = 0
+    regressed = 0
+    for key in ["error_rate_percent", "dns_error_rate_percent", "memory_percent", "p95_latency_ms"]:
+        before_value = before_metrics.get(key)
+        after_value = after_metrics.get(key)
+        if not isinstance(before_value, (int, float)) or not isinstance(after_value, (int, float)):
+            continue
+        comparable += 1
+        tolerance = max(abs(float(before_value)) * 0.1, 0.1)
+        delta = float(after_value) - float(before_value)
+        if delta > tolerance:
+            regressed += 1
+        elif delta < -tolerance:
+            improved += 1
+
+    if regressed and regressed >= improved:
+        return "regressed"
+    if improved:
+        return "improved"
+    if comparable:
+        return "unchanged"
+    return "inconclusive"
 
 
-def _reset_demo_service() -> Dict[str, Any]:
-    settings = get_settings()
-    base_url = settings.demo_service_api_url.rstrip("/")
-    return _json_request("POST", f"{base_url}/admin/reset", body={}, timeout=5.0)
-
-
-def _prometheus_value(query: str) -> float | None:
-    settings = get_settings()
-    base_url = settings.prometheus_api_url.rstrip("/")
-    payload = _json_request("GET", f"{base_url}/api/v1/query?query={quote(query, safe='')}", timeout=5.0)
-    values = (((payload or {}).get("data") or {}).get("result") or [])
-    if not values:
-        return None
-    value = values[0].get("value", [None, None])[1]
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _grafana_alert_state(alert_name: str) -> str:
-    settings = get_settings()
-    base_url = settings.grafana_api_url.rstrip("/")
-    payload = _json_request(
-        "GET",
-        f"{base_url}/api/prometheus/grafana/api/v1/alerts",
-        basic_auth=(settings.grafana_username, settings.grafana_password),
-        timeout=5.0,
-    )
-    alerts = (((payload or {}).get("data") or {}).get("alerts") or [])
-    for alert in alerts:
-        labels = alert.get("labels") or {}
-        if str(labels.get("alertname", "")) == alert_name:
-            return str(alert.get("state", "Normal"))
-    return "Normal"
-
-
-def verify_alert_resolution(incident_id: str) -> Dict[str, Any]:
-    settings = get_settings()
-    scenario = get_alert_lab_scenario(incident_id)
-    if not scenario:
-        return {"enabled": False, "resolved": False, "reason": "not_alert_lab_incident"}
-
-    deadline = time.time() + settings.alert_verify_timeout_seconds
-    alert_state = "Unknown"
-    metric_value = None
-    threshold = float(scenario.get("resolved_below", 0.0))
-
-    while time.time() < deadline:
-        metric_value = _prometheus_value(str(scenario["query"]))
-        alert_state = _grafana_alert_state(str(scenario["alertname"]))
-        metric_ok = metric_value is not None and metric_value < threshold
-        alert_ok = alert_state.lower() not in {"alerting", "pending"}
-        if metric_ok and alert_ok:
-            return {
-                "enabled": True,
-                "resolved": True,
-                "incident_id": incident_id,
-                "alertname": scenario["alertname"],
-                "alert_state": alert_state,
-                "metric_value": metric_value,
-                "metric_threshold": threshold,
-            }
-        time.sleep(settings.alert_verify_poll_seconds)
-
-    return {
-        "enabled": True,
-        "resolved": False,
-        "incident_id": incident_id,
-        "alertname": scenario["alertname"],
-        "alert_state": alert_state,
-        "metric_value": metric_value,
-        "metric_threshold": threshold,
-    }
-
-
-def execute_alert_lab_action(
-    *,
-    run_id: str,
+def collect_stabilized_evidence(
     tool_mode: str,
     incident_id: str,
     incident: Dict[str, Any],
-    action: Dict[str, Any],
-    evidence_before: Dict[str, Any],
-    planned_command: str,
-    diagnosis: str = "Unknown",
-) -> Dict[str, Any]:
-    execution_results: List[Dict[str, Any]] = []
+) -> tuple[Dict[str, Any], List[Dict[str, Any]], bool]:
+    settings = get_settings()
+    duration = max(float(settings.verification_stabilization_seconds), 0.0)
+    interval = max(float(settings.verification_sample_interval_seconds), 0.1)
+    deadline = time.monotonic() + duration
+    samples: List[Dict[str, Any]] = []
+    timed_out = False
 
-    if action["action_type"].startswith("gitops_"):
-        execution_results.append(
-            GitOpsExecutor().apply_action(run_id=run_id or incident_id, action=action, incident=incident)
-        )
+    while True:
+        try:
+            sample = collect_evidence(tool_mode, incident_id, incident)
+            samples.append({"observed_at": time.time(), "evidence": sample})
+        except TimeoutError:
+            timed_out = True
+            break
+        if duration <= 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
-    execution_results.append(get_tool_client(tool_mode, incident_id, allow_write=True).execute_remediation(action=action))
-
-    verification: Dict[str, Any]
-    try:
-        reset_payload = _reset_demo_service()
-        execution_results.append(
-            {
-                "tool": "alert_lab_adapter",
-                "status": "ok",
-                "action": "reset_demo_service",
-                "response": reset_payload,
-            }
-        )
-        verification = verify_alert_resolution(incident_id)
-    except Exception as exc:
-        execution_results.append(
-            {
-                "tool": "alert_lab_adapter",
-                "status": "error",
-                "action": "reset_demo_service",
-                "error": str(exc),
-            }
-        )
-        verification = {
-            "enabled": False,
-            "resolved": False,
-            "incident_id": incident_id,
-            "reason": f"alert_lab_unavailable: {exc}",
-        }
-
-    after = collect_evidence(tool_mode, incident_id, incident)
-    improvement = assess_improvement(evidence_before, after)
-    catalog_verification = assess_verification_rules(diagnosis, evidence_before, after)
-    improved = bool(improvement["improved"] or verification.get("resolved", False) or catalog_verification.get("resolved", False))
-
-    summary_parts = [improvement["summary"]]
-    if verification.get("enabled"):
-        summary_parts.append(
-            f"alert_resolution={verification.get('resolved', False)} "
-            f"grafana_state={verification.get('alert_state', 'Unknown')} "
-            f"signal={verification.get('metric_value')}"
-        )
-
-    merged_verification = {
-        **catalog_verification,
-        "enabled": bool(catalog_verification.get("enabled") or verification.get("enabled")),
-        "resolved": bool(catalog_verification.get("resolved") or verification.get("resolved")),
-        "external": verification,
-        "alert_state": verification.get("alert_state", catalog_verification.get("alert_state", "")),
-        "metric_value": verification.get("metric_value"),
-        "metric_threshold": verification.get("metric_threshold"),
-    }
-
-    return {
-        "status": "completed",
-        "execution_results": execution_results,
-        "evidence_after": after,
-        "improved": improved,
-        "improvement_summary": "; ".join(part for part in summary_parts if part),
-        "command": planned_command,
-        "verification": merged_verification,
-    }
+    after = dict((samples[-1] if samples else {}).get("evidence") or {})
+    return after, samples, timed_out
 
 
 def collect_evidence(tool_mode: str, incident_id: str, incident: Dict[str, Any]) -> Dict[str, Any]:
@@ -312,19 +215,14 @@ def execute_action(
 ) -> Dict[str, Any]:
     normalized_action = normalize_action(action, incident)
     planned_command = render_action_to_command(normalized_action, incident)
-    if execution_mode == "live" and is_alert_lab_incident(incident_id) and get_settings().demo_service_api_url:
-        return execute_alert_lab_action(
-            run_id=run_id,
-            tool_mode=tool_mode,
-            incident_id=incident_id,
-            incident=incident,
-            action=normalized_action,
-            evidence_before=evidence_before,
-            planned_command=planned_command,
-            diagnosis=diagnosis,
-        )
-
-    if normalized_action["action_type"].startswith("gitops_"):
+    if execution_mode == "preview":
+        return {"status": "preview", "execution_results": [], "evidence_after": {}, "improved": False,
+                "improvement_summary": "Preview only. No changes were applied.", "command": planned_command, "verification": {}}
+    if execution_mode not in {"live", "simulate"}:
+        raise ValueError("Execution mode must be preview, simulate, or live")
+    if execution_mode == "simulate" and get_settings().mcp_backend != "mock":
+        raise ValueError("Simulation requires the mock backend")
+    if normalized_action["action_type"].startswith("gitops_") and execution_mode == "live":
         result = GitOpsExecutor().apply_action(run_id=run_id or incident_id, action=normalized_action, incident=incident)
         return {
             "status": "completed",
@@ -333,14 +231,33 @@ def execute_action(
             "improved": False,
             "improvement_summary": "GitOps change artifact was created. Merge and rollout happen outside the agent.",
             "command": planned_command,
-            "verification": {},
+            "verification": {
+                "enabled": False,
+                "resolved": False,
+                "status": "inconclusive",
+                "reason": "gitops_change_created_rollout_not_observed",
+                "checks": [],
+                "stabilization": {"window_seconds": 0, "sample_count": 0, "samples": []},
+            },
         }
 
     if execution_mode == "live":
         client = KubectlMCPClient()
         result = client.execute_remediation(action=normalized_action, incident=incident)
-        after = collect_evidence(tool_mode, incident_id, incident)
+        after, verification_samples, verification_timed_out = collect_stabilized_evidence(tool_mode, incident_id, incident)
         verification = assess_verification_rules(diagnosis, evidence_before, after)
+        verification["status"] = classify_verification_outcome(
+            evidence_before,
+            after,
+            verification,
+            timed_out=verification_timed_out,
+        )
+        verification["stabilization"] = {
+            "window_seconds": get_settings().verification_stabilization_seconds,
+            "sample_interval_seconds": get_settings().verification_sample_interval_seconds,
+            "sample_count": len(verification_samples),
+            "samples": verification_samples,
+        }
         improvement = assess_improvement(evidence_before, after)
         return {
             "status": "completed",
@@ -354,9 +271,21 @@ def execute_action(
 
     client = get_tool_client(tool_mode, incident_id, allow_write=True)
     result = client.execute_remediation(action=normalized_action)
-    after = collect_evidence(tool_mode, incident_id, incident)
+    after, verification_samples, verification_timed_out = collect_stabilized_evidence(tool_mode, incident_id, incident)
     improvement = assess_improvement(evidence_before, after)
     verification = assess_verification_rules(diagnosis, evidence_before, after)
+    verification["status"] = classify_verification_outcome(
+        evidence_before,
+        after,
+        verification,
+        timed_out=verification_timed_out,
+    )
+    verification["stabilization"] = {
+        "window_seconds": get_settings().verification_stabilization_seconds,
+        "sample_interval_seconds": get_settings().verification_sample_interval_seconds,
+        "sample_count": len(verification_samples),
+        "samples": verification_samples,
+    }
     return {
         "status": "completed",
         "execution_results": [result],
@@ -377,6 +306,13 @@ def execute_rollback(
     incident: Dict[str, Any],
     action: Dict[str, Any],
 ) -> Dict[str, Any]:
+    if execution_mode == "preview":
+        return {"status": "preview", "execution_results": [], "evidence_after": {}, "improved": False,
+                "improvement_summary": "Preview only. No rollback was applied.", "command": rollback_command_for_action(action, incident), "verification": {}}
+    if execution_mode not in {"live", "simulate"}:
+        raise ValueError("Execution mode must be preview, simulate, or live")
+    if execution_mode == "simulate" and get_settings().mcp_backend != "mock":
+        raise ValueError("Simulation requires the mock backend")
     rollback_action = rollback_action_for_action(action, incident)
     if rollback_action is None:
         return {
@@ -390,7 +326,7 @@ def execute_rollback(
         }
 
     rollback_command = rollback_command_for_action(action, incident)
-    if rollback_action["action_type"].startswith("gitops_"):
+    if rollback_action["action_type"].startswith("gitops_") and execution_mode == "live":
         result = GitOpsExecutor().apply_rollback(run_id=run_id or incident_id, rollback_action=rollback_action, incident=incident)
         return {
             "status": "completed",

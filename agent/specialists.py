@@ -255,16 +255,38 @@ def _change_finding(evidence: Dict[str, Any], service_memory: Dict[str, Any]) ->
             recommended_next_tools=["get_recent_deploys", "get_incident_history", "get_service_owner"],
         )
 
-    if deploys and int(deploys[0].get("minutes_ago", 10_000) or 10_000) <= 30:
-        candidate_hints.append(_candidate_hint("DeploymentRegression", 0.92))
+    age = deploys[0].get("minutes_ago") if deploys else None
+    recent_deploy = isinstance(age, (int, float)) and 0 <= age <= 30
+    metrics = dict(evidence.get("metrics") or {})
+    logs_text = " ".join(str(item) for item in (evidence.get("logs_tail") or [])).lower()
+    strong_runtime_signal = (
+        float(metrics.get("error_rate_percent", 0.0) or 0.0) >= 5
+        or float(metrics.get("p95_latency_ms", 0.0) or 0.0) >= 1000
+        or any(token in logs_text for token in ["503", "timeout", "regression", "exception", "connection refused", "nxdomain"])
+    )
+
+    if recent_deploy and strong_runtime_signal:
+        candidate_hints.append(_candidate_hint("DeploymentRegression", 0.78))
         return _build_finding(
             "change",
             status="supporting",
-            confidence=0.84,
+            confidence=0.72,
             summary="A recent deploy strongly correlates with the alert window.",
             observations=observations,
             citations=["tool:get_recent_deploys", "tool:get_incident_history", "tool:get_service_owner"],
             candidate_hints=candidate_hints,
+        )
+    if recent_deploy:
+        candidate_hints.append(_candidate_hint("DeploymentRegression", 0.28))
+        return _build_finding(
+            "change",
+            status="neutral",
+            confidence=0.32,
+            summary="A recent deploy is worth checking, but current logs and metrics do not yet tie it to the failure.",
+            observations=observations,
+            citations=["tool:get_recent_deploys", "tool:get_incident_history", "tool:get_service_owner"],
+            candidate_hints=candidate_hints,
+            recommended_next_tools=["get_pod_logs", "get_metrics"],
         )
 
     if history:

@@ -18,11 +18,16 @@ from agent.deterministic_policy import (
 from agent.model_runtime import passive_model_status, record_model_failure, record_model_success
 from agent.prompts import build_planner_system_prompt
 from agent.state import AgentState
-from mcp_tools.actions import normalize_action
-from ops.runtime import run_with_retry
-from ops.settings import get_settings
+from integrations.actions import normalize_action
+from runtime.resilience import run_with_retry
+from runtime.settings import get_settings
 
 MIN_ACTION_CONFIDENCE = 0.55
+
+
+def _compact_text(value: Any, *, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit]
 
 
 class PlannerAction(BaseModel):
@@ -33,21 +38,35 @@ class PlannerAction(BaseModel):
     namespace: str | None = None
     replicas: int | None = None
     previous_replicas: int | None = None
-    reason: str = ""
+    reason: str = Field(default="", max_length=400)
     execution_model: str | None = None
     manifest_path: str | None = None
+    current_version: str | None = None
+    previous_version: str | None = None
+
+
+class PlannerHypothesis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cause: str = Field(min_length=1, max_length=160)
+    confidence: float = Field(ge=0.0, le=1.0)
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    contradicting_evidence_ids: list[str] = Field(default_factory=list)
+    evidence_needed: list[str] = Field(default_factory=list)
 
 
 class AgentDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     thought_summary: str = Field(min_length=1, max_length=400)
+    situation_summary: str = Field(default="", max_length=400)
+    hypotheses: list[PlannerHypothesis] = Field(default_factory=list, max_length=4)
     hypothesis: str = Field(default="Unknown", min_length=1, max_length=80)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     decision: Literal["call_tool", "propose_action", "escalate"]
     tool_name: str | None = None
     proposed_action: PlannerAction | None = None
-    escalation_reason: str | None = None
+    escalation_reason: str | None = Field(default=None, max_length=400, description="One concise sentence explaining escalation; do not repeat the prompt")
 
     @model_validator(mode="after")
     def validate_branch_payload(self) -> "AgentDecision":
@@ -62,7 +81,9 @@ class AgentDecision(BaseModel):
             if self.proposed_action.action_type not in ALLOWED_ACTION_TYPES:
                 raise ValueError("action_type must be one of the allowed structured actions")
         elif self.decision == "escalate" and not (self.escalation_reason or "").strip():
-            raise ValueError("escalation_reason is required for escalate")
+            # Small models sometimes put the explanation only in thought_summary.
+            # Reuse their exact text; never change the decision or invent evidence.
+            self.escalation_reason = self.thought_summary
         return self
 
 
@@ -74,7 +95,7 @@ def _planner_context(state: AgentState) -> Dict[str, Any]:
                 "incident_type": chunk.get("incident_type"),
                 "source_file": chunk.get("source_file"),
                 "section": chunk.get("section"),
-                "text": str(chunk.get("text", ""))[:700],
+                "text": _compact_text(chunk.get("text", ""), limit=280),
             }
         )
 
@@ -98,20 +119,32 @@ def _planner_context(state: AgentState) -> Dict[str, Any]:
         "seed_hypothesis": state.get("predicted_type", "Unknown"),
         "retrieval_query": state.get("retrieval_query", ""),
         "retrieval_quality": state.get("retrieval_quality", {}),
-        "candidate_diagnoses": state.get("candidate_diagnoses", [])[:3],
+        "candidate_diagnoses": [
+            {
+                "incident_type": item.get("incident_type"),
+                "score": round(float(item.get("score", item.get("retrieval_confidence", 0.0)) or 0.0), 3),
+                "supporting_points": [
+                    _compact_text(point, limit=140) for point in list(item.get("supporting_points") or [])[:2]
+                ],
+                "contradicting_signals": [
+                    _compact_text(point, limit=140) for point in list(item.get("contradicting_signals") or [])[:2]
+                ],
+            }
+            for item in state.get("candidate_diagnoses", [])[:3]
+        ],
         "specialist_findings": [
             {
                 "specialist": item.get("specialist"),
                 "status": item.get("status"),
                 "confidence": item.get("confidence"),
-                "summary": item.get("summary"),
+                "summary": _compact_text(item.get("summary"), limit=160),
                 "recommended_next_tools": item.get("recommended_next_tools", []),
             }
             for item in state.get("specialist_findings", [])[:4]
         ],
         "coordinator_summary": {
             "focus": dict(state.get("coordinator_summary") or {}).get("focus", ""),
-            "summary": dict(state.get("coordinator_summary") or {}).get("summary", ""),
+            "summary": _compact_text(dict(state.get("coordinator_summary") or {}).get("summary", ""), limit=180),
             "recommended_next_tool": dict(state.get("coordinator_summary") or {}).get("recommended_next_tool", ""),
             "reliability": dict(state.get("coordinator_summary") or {}).get("reliability", ""),
         },
@@ -119,6 +152,17 @@ def _planner_context(state: AgentState) -> Dict[str, Any]:
         "max_steps": int(state.get("max_steps", 4)),
         "retrieved_runbooks": retrieved,
         "tool_observations": tool_observations,
+        "evidence_ledger": [
+            {
+                "evidence_id": item.get("evidence_id"),
+                "tool": item.get("tool"),
+                "source": item.get("source"),
+                "observed_at": item.get("observed_at"),
+                "status": item.get("status"),
+                "payload": item.get("payload"),
+            }
+            for item in state.get("evidence_ledger", [])[-8:]
+        ],
         "evidence": evidence_from_tools(state),
         "allowed_tools": ALLOWED_READ_TOOLS,
         "allowed_action_types": ALLOWED_ACTION_TYPES,
@@ -126,6 +170,8 @@ def _planner_context(state: AgentState) -> Dict[str, Any]:
 
 
 def _parse_planner_response(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if raw_payload.get("done_reason") == "length":
+        raise ValueError("Planner exhausted its output token budget before completing the response")
     if isinstance(raw_payload.get("message"), dict):
         content = raw_payload["message"].get("content", "")
     else:
@@ -160,6 +206,8 @@ def _call_ollama(state: AgentState) -> AgentDecision:
         ],
         "options": {
             "temperature": settings.planner_temperature,
+            "num_ctx": settings.planner_context_tokens,
+            "num_predict": settings.planner_output_tokens,
         },
     }
 
@@ -216,6 +264,8 @@ def _call_openai_compatible(state: AgentState) -> AgentDecision:
     choices = list(raw.get("choices", []))
     if not choices:
         raise ValueError("Planner returned no choices")
+    if choices[0].get("finish_reason") == "length":
+        raise ValueError("Planner exhausted its output token budget before completing the response")
     message = dict((choices[0] or {}).get("message") or {})
     content = message.get("content", "")
     if isinstance(content, list):
@@ -248,6 +298,8 @@ def _force_additional_tool(state: AgentState, decision: AgentDecision) -> AgentD
 
     return AgentDecision(
         thought_summary=f"Signals still point to {predicted_type}. Gather {next_tool} before escalating.",
+        situation_summary=decision.situation_summary,
+        hypotheses=decision.hypotheses,
         hypothesis=predicted_type,
         confidence=max(float(decision.confidence or 0.0), 0.25),
         decision="call_tool",
@@ -260,6 +312,11 @@ def _force_additional_tool(state: AgentState, decision: AgentDecision) -> AgentD
 def _apply_deterministic_guardrails(state: AgentState, decision: AgentDecision) -> AgentDecision:
     fallback = AgentDecision.model_validate(deterministic_decision(state))
 
+    if decision.decision == "propose_action" and (
+        fallback.decision != "propose_action" or decision.hypothesis != fallback.hypothesis
+    ):
+        return fallback
+
     # If the rules already have enough evidence, do not let the model escalate or
     # keep calling extra tools.
     if fallback.decision == "propose_action":
@@ -269,8 +326,15 @@ def _apply_deterministic_guardrails(state: AgentState, decision: AgentDecision) 
             return fallback
         fallback_action = normalize_action_from_decision(state, fallback)
         decision_action = normalize_action_from_decision(state, decision)
-        if fallback_action["action_type"] != decision_action["action_type"]:
+        material_keys = {"action_type", "target", "namespace", "replicas", "previous_replicas", "manifest_path", "previous_version"}
+        if any(fallback_action.get(key) != decision_action.get(key) for key in material_keys):
             return fallback
+
+    # A confirmed diagnosis without a catalog action is intentionally
+    # escalation-only. The model cannot invent a write merely because the
+    # action type exists elsewhere in the global catalog.
+    if fallback.decision == "escalate" and str(fallback.hypothesis or "Unknown") != "Unknown":
+        return fallback
 
     # If the model escalates too early or proposes a weak-confidence action,
     # keep gathering the next discriminating tool instead of ending the run.
@@ -289,6 +353,10 @@ def plan_next_step(state: AgentState) -> tuple[AgentDecision, str, str]:
 
     if provider == "deterministic":
         return _deterministic_fallback(state), "deterministic", ""
+
+    prior_error = str(state.get("planner_error") or "").strip()
+    if prior_error:
+        return _deterministic_fallback(state), f"{provider}_run_fallback", prior_error
 
     model_status = passive_model_status()
     if model_status.get("cooldown_active"):
